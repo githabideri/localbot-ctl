@@ -1,0 +1,11 @@
+# Node
+node_modules/
+
+# Build artifacts
+dist/
+*.js
+*.js.map
+*.d.ts
+
+# Local config (contains room IDs)
+# Use config/localbot-rooms.example.json as template
