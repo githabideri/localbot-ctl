@@ -89,17 +89,32 @@ function readSessionStore(agentId: string): Record<string, any> {
 
 function formatHelp(): string {
   const rooms = Object.values(getRooms()).map(r => r.roomName).join(", ");
-  return `📖 LocalBot Commands
+  return `🤖 LocalBot Control
 
-/lbm           List available models with specs
-/lbn <room>    Reset LocalBot session
-/lbs           Status (backend, GPU, model)
-/lbe           Show all inference endpoints
-/lbw <backend> Switch backend (llama-cpp|vllm|stop)
-/lbp           Performance benchmark
+LocalBot runs on local GPU hardware with switchable inference backends. Use these commands to monitor, switch, and benchmark.
 
-Rooms: ${rooms}
-Speed: fresh→filled (tok/s with empty vs full context)`;
+━━━ Commands ━━━
+
+/lbs                Status — backend, GPU, model, slots
+/lbm                Models — list available models with specs
+/lbe                Endpoints — show all inference backends
+/lbw <backend>      Switch — llama-cpp | vllm | stop
+/lbp                Benchmark — test active endpoint speed
+/lbn <room>         Reset — clear session context
+/lbh                This help
+
+━━━ Backends ━━━
+
+▸ llama-cpp — GGUF models, slot persistence, fast startup (~8s)
+▸ vLLM — HF/AWQ models, LMCache, slower startup (~80s)
+
+Only one runs at a time. Switching saves state automatically.
+
+━━━ Rooms ━━━
+${rooms}
+
+━━━ Speed Notation ━━━
+fresh→filled = tok/s with empty context → tok/s near full context`;
 }
 
 export function registerLocalBotCommands(api: OpenClawPluginApi) {
