@@ -1,0 +1,18 @@
+{
+  "rooms": {
+    "!your-room-id:your-server.example": {
+      "agentId": "localbot-main",
+      "roomName": "main",
+      "publicReset": false
+    },
+    "!another-room:your-server.example": {
+      "agentId": "localbot-public",
+      "roomName": "public",
+      "publicReset": true
+    }
+  },
+  "meta": {
+    "description": "LocalBot room mappings - copy to workspace config/localbot-rooms.json",
+    "lastUpdated": "2026-02-10"
+  }
+}

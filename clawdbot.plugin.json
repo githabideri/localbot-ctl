@@ -1,0 +1,21 @@
+{
+  "id": "localbot-ctl",
+  "name": "localbot-ctl",
+  "version": "0.1.0",
+  "description": "Control local LLM inference via /lb* chat commands",
+  "entry": "index.ts",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "endpointsPath": {
+        "type": "string",
+        "description": "Path to inference-endpoints.json"
+      },
+      "modelsPath": {
+        "type": "string",
+        "description": "Path to localbot-models.json"
+      }
+    }
+  }
+}
