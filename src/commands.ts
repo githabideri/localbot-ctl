@@ -9,6 +9,13 @@ import {
   type ProbeResult,
   type EndpointsRegistry,
 } from "./endpoints.js";
+import {
+  getWechslerStatus,
+  switchBackend,
+  stopBackend,
+  formatGpuMemory,
+  type WechslerConfig,
+} from "./wechsler.js";
 
 type PluginConfig = {
   endpointsPath?: string;
@@ -86,8 +93,9 @@ function formatHelp(): string {
 
 /lbm           List available models with specs
 /lbn <room>    Reset LocalBot session
-/lbs           Status (endpoints, active model)
+/lbs           Status (backend, GPU, model)
 /lbe           Show all inference endpoints
+/lbw <backend> Switch backend (llama-cpp|vllm|stop)
 /lbp           Performance benchmark
 
 Rooms: ${rooms}
@@ -110,51 +118,66 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
     },
   });
 
-  // /lbs - Status (quick view)
+  // /lbs - Status (quick view with wechsler)
   api.registerCommand({
     name: "lbs",
-    description: "LocalBot status - active endpoint and model",
+    description: "LocalBot status - backend, GPU, model",
     acceptsArgs: false,
     requireAuth: true,
     handler: async () => {
       const registry = loadEndpointsRegistry(endpointsPath);
-      if (!registry) {
-        return { text: `❌ Could not load endpoints from ${endpointsPath}` };
+      const wechslerConfig = (registry as any)?.wechsler as WechslerConfig | undefined;
+      const wStatus = await getWechslerStatus(wechslerConfig?.scriptPath);
+      
+      const modelsRegistry = loadModelsRegistry();
+      const lines: string[] = ["🤖 LocalBot Status", ""];
+
+      // GPU server state
+      if (wStatus.state === "gpu-offline") {
+        lines.push("🔴 GPU server offline");
+        lines.push("   Use /lbw llama-cpp or /lbw vllm to start");
+      } else if (wStatus.state === "gpu-idle") {
+        lines.push("🟡 GPU server up, no backend running");
+        lines.push("   Use /lbw llama-cpp or /lbw vllm to start");
+      } else {
+        lines.push(`🟢 Backend: ${wStatus.active_backend}`);
+        
+        // GPU memory
+        if (wStatus.gpu_memory) {
+          lines.push(`🖥️ GPU: ${formatGpuMemory(wStatus.gpu_memory)}`);
+        }
       }
 
-      const modelsRegistry = loadModelsRegistry();
-      const active = await getActiveEndpoint(registry);
-      
-      const lines: string[] = ["🤖 LocalBot Status", ""];
-      
-      if (active && active.online) {
-        lines.push(`✅ Active: ${active.endpoint.name}`);
-        lines.push(`📦 Model: ${active.model}`);
-        
-        const meta = active.model && modelsRegistry 
-          ? findModelMetadata(active.model, modelsRegistry) 
-          : null;
-        
-        if (meta) {
-          lines.push(`   ${meta.name} (${meta.alias})`);
-          lines.push(`📐 Context: ${Math.round(meta.context / 1024)}k | ${meta.vramFit} VRAM`);
-          lines.push(`⚡ Speed: gen ${meta.speeds.genFresh}→${meta.speeds.genFilled} | pp ${meta.speeds.promptFresh}→${meta.speeds.promptFilled} tok/s`);
-          if (meta.notes) {
-            lines.push(`💡 ${meta.notes}`);
+      // Active model info (probe endpoint)
+      if (registry && (wStatus.state === "llama-cpp" || wStatus.state === "vllm")) {
+        const active = await getActiveEndpoint(registry);
+        if (active?.online) {
+          lines.push(`📦 Model: ${active.model}`);
+          
+          const meta = active.model && modelsRegistry 
+            ? findModelMetadata(active.model, modelsRegistry) 
+            : null;
+          
+          if (meta) {
+            lines.push(`   ${meta.name} (${meta.alias})`);
+            lines.push(`📐 Context: ${Math.round(meta.context / 1024)}k | ${meta.vramFit} VRAM`);
+            lines.push(`⚡ Speed: gen ${meta.speeds.genFresh}→${meta.speeds.genFilled} | pp ${meta.speeds.promptFresh}→${meta.speeds.promptFilled} tok/s`);
+          } else if (active.contextWindow) {
+            lines.push(`📐 Context: ${Math.round(active.contextWindow / 1024)}k tokens`);
           }
-        } else if (active.contextWindow) {
-          lines.push(`📐 Context: ${Math.round(active.contextWindow / 1024)}k tokens`);
-          lines.push(`⚡ Latency: ${active.latencyMs}ms`);
         }
-        
-        if (!meta && active.endpoint.notes) {
-          lines.push(`💡 ${active.endpoint.notes}`);
-        }
-      } else {
-        lines.push(`❌ No endpoints online`);
-        if (active?.error) {
-          lines.push(`   Error: ${active.error}`);
-        }
+      }
+
+      // Slot info (llama-cpp only)
+      if (wStatus.state === "llama-cpp" && wStatus.slots && wStatus.slots.length > 0) {
+        const slot = wStatus.slots[0];
+        const ctxK = Math.round(slot.n_ctx / 1024);
+        lines.push(`🧠 Slot: ${ctxK}k ctx${slot.is_processing ? " (busy)" : " (idle)"}`);
+      }
+
+      // Saved slots
+      if (wStatus.saved_slots.length > 0) {
+        lines.push(`💾 Saved: ${wStatus.saved_slots.join(", ")}`);
       }
       
       // Session stats
@@ -369,6 +392,48 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
       }
 
       return { text: `❌ Unknown endpoint type: ${endpoint.type}` };
+    },
+  });
+
+  // /lbw - Switch backend via wechsler
+  api.registerCommand({
+    name: "lbw",
+    description: "Switch inference backend (llama-cpp|vllm|stop)",
+    acceptsArgs: true,
+    requireAuth: true,
+    handler: async (ctx) => {
+      const target = ctx.args?.trim().toLowerCase();
+      
+      if (!target || !["llama-cpp", "vllm", "stop"].includes(target)) {
+        const wStatus = await getWechslerStatus(
+          ((loadEndpointsRegistry(endpointsPath) as any)?.wechsler as WechslerConfig | undefined)?.scriptPath
+        );
+        return {
+          text: `Usage: /lbw <llama-cpp|vllm|stop>\n\nCurrent: ${wStatus.state}`,
+        };
+      }
+
+      const wechslerConfig = (loadEndpointsRegistry(endpointsPath) as any)?.wechsler as WechslerConfig | undefined;
+
+      if (target === "stop") {
+        const result = await stopBackend(wechslerConfig?.scriptPath);
+        return {
+          text: result.success
+            ? `✅ Backend stopped\n\n${result.output}`
+            : `❌ Stop failed\n\n${result.output}`,
+        };
+      }
+
+      const result = await switchBackend(
+        target as "llama-cpp" | "vllm",
+        wechslerConfig?.scriptPath
+      );
+      
+      return {
+        text: result.success
+          ? `✅ Switched to ${target}\n\n${result.output}`
+          : `❌ Switch failed\n\n${result.output}`,
+      };
     },
   });
 
