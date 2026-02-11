@@ -6,11 +6,12 @@ OpenClaw plugin for controlling local LLM inference via `/lb*` chat commands.
 
 | Command | Description | Auth Required |
 |---------|-------------|---------------|
-| `/lbh` | Help — show available commands | Yes |
+| `/lbh` | Help — show available commands and backend info | Yes |
 | `/lbm` | Models — list available models with specs | Yes |
 | `/lbn <room>` | New session — reset LocalBot context | Per-room* |
-| `/lbs` | Status — active endpoint, model, session tokens | Yes |
+| `/lbs` | Status — backend state, GPU memory, model, slots | Yes |
 | `/lbe` | Endpoints — show all inference backends | Yes |
+| `/lbw <backend>` | Switch backend (llama-cpp\|vllm\|stop) | Yes |
 | `/lbp` | Performance — benchmark active endpoint | Yes |
 
 *See Security section below.
@@ -101,6 +102,24 @@ Copy `config/localbot-rooms.example.json` to your workspace and customize.
 - **Model switching not implemented**: `/lbm <alias>` is planned but requires llama-cpp server interaction.
 - **Config path**: Room config path is currently hardcoded to workspace. Override via plugin config if needed.
 
+## Backend Switching (wechsler-llm)
+
+`/lbw` integrates with [wechsler-llm](https://github.com/githabideri/wechsler-llm) for clean backend switching:
+
+- Only one GPU backend runs at a time (llama-cpp OR vLLM)
+- Switching automatically saves/restores KV cache state
+- `/lbs` shows GPU memory, slot state, and saved caches via wechsler
+
+Configure by adding a `wechsler` block to `inference-endpoints.json`:
+```json
+{
+  "wechsler": {
+    "scriptPath": "/path/to/wechsler-llm/wechsler.sh",
+    "managedEndpoints": ["llmlab-llama", "llmlab-vllm"]
+  }
+}
+```
+
 ## License
 
 MIT
@@ -109,3 +128,4 @@ MIT
 
 - [Specification](./SPEC.md) — Authoritative command behavior
 - [Changelog](./CHANGELOG.md) — Version history
+- [wechsler-llm](https://github.com/githabideri/wechsler-llm) — Backend switching ops toolkit
