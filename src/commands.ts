@@ -105,10 +105,12 @@ LocalBot runs on local GPU hardware with switchable inference backends. Use thes
 
 ━━━ Backends ━━━
 
-▸ llama-cpp — GGUF models, slot persistence, fast startup (~8s)
-▸ vLLM — HF/AWQ models, LMCache, slower startup (~80s)
+▸ llama-cpp — GPU, GGUF models, slot persistence, fast startup (~8s)
+▸ vLLM — GPU, HF/AWQ models, LMCache, slower startup (~80s)
+▸ llama-local — CPU, always-on fallback (~10 tok/s, 196k ctx)
 
-Only one runs at a time. Switching saves state automatically.
+GPU: only one runs at a time. Switching saves state automatically.
+CPU: always available independently.
 
 ━━━ Rooms ━━━
 ${rooms}
@@ -194,7 +196,27 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
       if (wStatus.saved_slots.length > 0) {
         lines.push(`💾 Saved: ${wStatus.saved_slots.join(", ")}`);
       }
-      
+
+      // Local CPU server status
+      lines.push("");
+      if (wStatus.local) {
+        if (wStatus.local.state === "local-running") {
+          lines.push("🟢 Local (CPU): running");
+          if (wStatus.local.slots && wStatus.local.slots.length > 0) {
+            const localSlot = wStatus.local.slots[0];
+            const localCtxK = Math.round(localSlot.n_ctx / 1024);
+            lines.push(`   🧠 ${localCtxK}k ctx, ~10 tok/s${localSlot.is_processing ? " (busy)" : ""}`);
+          }
+          if (wStatus.local.saved_slots.length > 0) {
+            lines.push(`   💾 Saved: ${wStatus.local.saved_slots.join(", ")}`);
+          }
+        } else if (wStatus.local.state === "local-offline") {
+          lines.push("⚫ Local (CPU): offline");
+        } else if (wStatus.local.state === "local-down") {
+          lines.push("🟡 Local (CPU): server up, llama-server not running");
+        }
+      }
+
       // Session stats
       lines.push("");
       let totalTokens = 0;

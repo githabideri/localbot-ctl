@@ -1,6 +1,13 @@
 import { execFile } from "child_process";
 
 export type WechslerState = "gpu-offline" | "gpu-idle" | "llama-cpp" | "vllm" | "unknown";
+export type LocalState = "local-offline" | "local-running" | "local-down" | "unknown";
+
+export type LocalStatus = {
+  state: LocalState;
+  slots: any[] | null;
+  saved_slots: string[];
+};
 
 export type WechslerStatus = {
   state: WechslerState;
@@ -8,6 +15,7 @@ export type WechslerStatus = {
   slots: any[] | null;
   saved_slots: string[];
   gpu_memory: { id: number; used_mib: number; total_mib: number }[] | null;
+  local?: LocalStatus;
 };
 
 export type WechslerConfig = {
