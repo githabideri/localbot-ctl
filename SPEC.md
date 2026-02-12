@@ -15,6 +15,9 @@ localbot-ctl provides chat commands (`/lb*`) for managing local LLM inference
 endpoints from within Matrix rooms. Commands are handled by the primary agent
 in each room, not by LocalBot itself.
 
+Reasoning-budget and prompt-style tuning are out of scope for this plugin;
+those are managed in backend service config and agent prompt policy.
+
 ---
 
 ## Commands

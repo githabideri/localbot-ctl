@@ -120,6 +120,15 @@ Configure by adding a `wechsler` block to `inference-endpoints.json`:
 }
 ```
 
+### Reasoning profile ownership
+
+`localbot-ctl` does **not** set model reasoning budgets or prompt reasoning style.
+Those are owned by backend service config + agent prompt policy (e.g. in wechsler/openclaw setup).
+
+Current recommended Nemotron profile used in llmlab:
+- server: `--reasoning-format deepseek --reasoning-budget -1`
+- prompt style: brief constrained reasoning
+
 ## License
 
 MIT
