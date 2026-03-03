@@ -13,6 +13,10 @@ All notable changes to localbot-ctl will be documented in this file.
 ### Changed
 - Renamed from `localbot-commands` to `localbot-ctl`
 - Version reset to 0.1.0 (pre-1.0 development)
+- `/lbs` now reports runtime slot detail (GPU + local CPU) and room-level OpenClaw context usage (`used/cap`) per mapped room
+- `/lbs` marks stale room session state (>24h), clamps over-cap counters (`store>cap`) for readable ratios, and excludes stale rooms from aggregate in-context totals
+- `/lbs` now starts with a `Quick ctx` operator summary (`used / effective-cap` + mini bar), then follows with grouped room details (`Active` vs `Stale`)
+- `/lbs` model labels clarified to avoid false regressions: top line now shows `📦 Runtime model`, per-room rows explicitly show `session-tag ...`, and room section explains the difference
 
 ### Planned
 - Restore `/lbm` model switching

@@ -7,9 +7,11 @@ OpenClaw plugin for controlling local LLM inference via `/lb*` chat commands.
 | Command | Description | Auth Required |
 |---------|-------------|---------------|
 | `/lbh` | Help — show available commands and backend info | Yes |
+| `/a [filter]` | Alias quick list for `/model` usage | Yes |
+| `/aliases [filter]` | Same as `/a` | Yes |
 | `/lbm` | Models — list available models with specs | Yes |
 | `/lbn <room>` | New session — reset LocalBot context | Per-room* |
-| `/lbs` | Status — backend state, GPU memory, model, slots | Yes |
+| `/lbs` | Status — backend state, GPU/CPU slots, and per-room context usage | Yes |
 | `/lbe` | Endpoints — show all inference backends | Yes |
 | `/lbw <backend>` | Switch backend (llama-cpp\|vllm\|stop) | Yes |
 | `/lbp` | Performance — benchmark active endpoint | Yes |
@@ -102,13 +104,33 @@ Copy `config/localbot-rooms.example.json` to your workspace and customize.
 - **Model switching not implemented**: `/lbm <alias>` is planned but requires llama-cpp server interaction.
 - **Config path**: Room config path is currently hardcoded to workspace. Override via plugin config if needed.
 
+## Matrix mention routing (tiered binding order)
+
+LocalBot routing in Matrix relies on a "tiered" specificity order: room-level bindings (matching `peer.kind` + `peer.id`) are evaluated before account-scoped constraints, and the catch-all `{"channel": "matrix"}` binding only matches once everything else misses. Keep this order intact when editing `config/localbot-rooms.json` or adding new agents, because the binding hierarchy determines whether messages routed via `@clawdbot` will reach the intended room-specific LocalBot or fall through to Felix.
+
+More background and the recent regression fix are documented without workspace secrets in `/var/lib/clawdbot/workspace/fundus/localbot-mentions.md`.
+
 ## Backend Switching (wechsler-llm)
 
 `/lbw` integrates with [wechsler-llm](https://github.com/githabideri/wechsler-llm) for clean backend switching:
 
 - Only one GPU backend runs at a time (llama-cpp OR vLLM)
 - Switching automatically saves/restores KV cache state
-- `/lbs` shows GPU memory, slot state, and saved caches via wechsler
+- `/lbs` shows GPU memory, all slot states (GPU + local CPU), and room-level OpenClaw session context usage (`used/cap`)
+- `/lbs` starts with an **operator-first quick line** (`Quick ctx`) for the most recently active room: `used / effective-cap` with a small usage bar
+
+`/lbs` context semantics:
+- **Runtime model** (`📦 Runtime model`) = model currently loaded by the active backend
+- **Room model label** (`session-tag ...`) = model tag from OpenClaw session store for that room
+  - this can differ from runtime model during transitions/sticky overrides and is now explicitly labeled
+- **Quick ctx** = latest active room load shown as `used / effective-cap`
+  - `effective-cap = min(runtime ctx cap, room session cap)`
+- **Runtime ctx cap** = backend-reported slot/model capacity (from endpoint + slot status)
+- **Room `used/cap`** = OpenClaw session-store prompt tokens versus session context limit per room
+- Room groups:
+  - `✅ Active (<24h)`
+  - `💤 Stale (>=24h)` (excluded from aggregate `in-context` total)
+- **`store>cap` marker** = stored counters exceeded cap; display is clamped to cap to avoid misleading >100% ratios
 
 Configure by adding a `wechsler` block to `inference-endpoints.json`:
 ```json

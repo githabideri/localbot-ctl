@@ -2,7 +2,7 @@
 
 **Version:** 0.1.0  
 **Status:** Draft  
-**Last Updated:** 2026-02-10
+**Last Updated:** 2026-03-03
 
 This is the authoritative specification for localbot-ctl behavior.
 All implementations and documentation must match this spec.
@@ -32,23 +32,67 @@ Show available commands and brief descriptions.
 
 ---
 
+### `/a [filter]` / `/aliases [filter]` — Model Alias List
+
+Show model aliases available for native `/model <alias>` usage.
+
+**Arguments:** Optional filter string  
+**Auth:** Required  
+**Output:** Aliases grouped by provider
+
+---
+
 ### `/lbs` — Status
 
-Show current inference status: active endpoint, loaded model, session tokens.
+Show current inference status across runtime + room sessions:
+- operator-first quick context line (`Quick ctx`) for the most recently active room
+- active backend + GPU memory
+- loaded model and runtime ctx cap
+- all visible slot states (GPU and local CPU)
+- per-room OpenClaw session context usage (`used/cap`) grouped by active/stale
 
 **Arguments:** None  
 **Auth:** Required  
-**Output:**
+**Output (example):**
 ```
 🤖 LocalBot Status
 
-✅ Active: llama-cpp-local
-📦 Model: Nemotron-3-Nano-30B-A3B (nemo30b)
-📐 Context: 131k | full VRAM
-⚡ Speed: gen 62→58 | pp 393→360 tok/s
+⚡ Quick ctx (llmlab)
+   20,703 / 98,304 (21.1%) [███░░░░░░░░░]
+   runtime cap 98,304 · session cap 131,072 · 6m ago
 
-📊 Sessions: 4 | 127k tokens
+🟢 Backend: llama-cpp
+🖥️ GPU: GPU0: 96% | GPU1: 92%
+📦 Runtime model: Qwen_Qwen3.5-35B-A3B-Q4_K_M
+📐 Runtime ctx cap: 98,304 tokens (~96k)
+🧠 GPU slots (1)
+   #0 · ctx 98,304 · idle · task 4537
+
+🟢 Local (CPU): running
+   Slots: 3
+   #0 · ctx 120,064 · idle
+   #1 · ctx 120,064 · idle
+   #2 · ctx 120,064 · busy · task 1943
+
+📚 Room ctx (details)
+   used / cap = session prompt tokens / session context cap
+   model shown per room = session-tag (may differ from runtime model)
+   Active (<24h):
+   ✅ llmlab         20,703 / 131,072 (15.8%) · 6m ago · session-tag Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf
+   Stale (>=24h):
+   💤 llmlab-control 31,073 / 131,072 (23.7%) · 2d ago · session-tag GLM-4.7-Flash-UD-Q4_K_XL.gguf
+   Legend: 💤 stale >=24h, store>cap = historical counter exceeded cap
+
+📊 Rooms: 6/6 resolved | active (<24h): 1 | in-context 20,703 tokens
 ```
+
+**Markers / semantics:**
+- `📦 Runtime model` = model currently loaded in active backend runtime
+- `session-tag ...` = model tag stored per room session entry (can differ from runtime model)
+- `Quick ctx` = most recently active room with `used / effective-cap`
+- `effective-cap = min(runtime ctx cap, session cap)`
+- `💤` = room not updated in the last 24h (excluded from aggregate in-context total)
+- `store>cap` = stored counters exceeded cap; ratio display is clamped to cap
 
 ---
 
@@ -74,29 +118,12 @@ Show available models from the model registry with specs.
 
 ---
 
-### `/lbm <alias>` — Switch Model
+### `/lbm <alias>` — Reserved (not implemented)
 
-Switch the llama-cpp server to a different model.
+Model switching through `/lbm <alias>` is currently **not implemented**.
+Use backend switch (`/lbw`) and native model controls where appropriate.
 
-**Arguments:** Model alias (e.g., `nemo30b`, `go20b`)  
-**Auth:** Required  
-**Behavior:**
-1. Validate alias exists in model registry
-2. SSH to llama-cpp server
-3. Stop current model, load new model
-4. Confirm switch
-
-**Output:**
-```
-🔄 Switching to nemo30b...
-✅ Model loaded: Nemotron-3-Nano-30B-A3B-IQ4_NL
-📐 Context: 131k tokens
-```
-
-**Error cases:**
-- Unknown alias: `❌ Unknown model: xyz. Use /lbm to list.`
-- SSH failure: `❌ Could not connect to llama-cpp server`
-- Load failure: `❌ Model failed to load: <error>`
+**Status:** Planned / reserved behavior
 
 ---
 
@@ -142,6 +169,7 @@ Commands use two authorization levels:
 | Command | Authorization |
 |---------|---------------|
 | `/lbh` | Authorized users only |
+| `/a`, `/aliases` | Authorized users only |
 | `/lbm` | Authorized users only |
 | `/lbn` | Per-room (see below) |
 | `/lbs` | Authorized users only |

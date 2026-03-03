@@ -66,6 +66,106 @@ function getRoomNameToId(): Record<string, string> {
 }
 
 const DEFAULT_ENDPOINTS_PATH = "/var/lib/clawdbot/workspace/config/inference-endpoints.json";
+const DEFAULT_GATEWAY_CONFIG_PATH = "/var/lib/clawdbot/.openclaw/openclaw.json";
+
+type AliasEntry = {
+  alias: string;
+  modelId: string;
+  provider: string;
+};
+
+function loadModelAliases(configPath: string = DEFAULT_GATEWAY_CONFIG_PATH): AliasEntry[] {
+  try {
+    const raw = fs.readFileSync(configPath, "utf-8");
+    const parsed = JSON.parse(raw) as {
+      agents?: {
+        defaults?: {
+          models?: Record<string, { alias?: string }>;
+        };
+      };
+    };
+
+    const modelMap = parsed?.agents?.defaults?.models ?? {};
+    const entries: AliasEntry[] = [];
+
+    for (const [modelId, config] of Object.entries(modelMap)) {
+      const alias = config?.alias?.trim();
+      if (!alias) continue;
+      const provider = modelId.split("/")[0] ?? "other";
+      entries.push({ alias, modelId, provider });
+    }
+
+    return entries.sort((a, b) => a.alias.localeCompare(b.alias));
+  } catch (e) {
+    console.warn(`[localbot-ctl] Could not load model aliases from ${configPath}: ${e}`);
+    return [];
+  }
+}
+
+function formatAliases(queryRaw?: string): string {
+  const all = loadModelAliases();
+  if (all.length === 0) {
+    return "❌ Could not load model aliases";
+  }
+
+  const query = queryRaw?.trim().toLowerCase();
+  const filtered = query
+    ? all.filter(entry =>
+        entry.alias.toLowerCase().includes(query) ||
+        entry.modelId.toLowerCase().includes(query) ||
+        entry.provider.toLowerCase().includes(query)
+      )
+    : all;
+
+  if (query && filtered.length === 0) {
+    return `❌ No aliases match "${queryRaw?.trim()}"`;
+  }
+
+  const grouped = new Map<string, AliasEntry[]>();
+  for (const entry of filtered) {
+    const list = grouped.get(entry.provider) ?? [];
+    list.push(entry);
+    grouped.set(entry.provider, list);
+  }
+
+  const providerOrder = [
+    "openai-codex",
+    "openai",
+    "anthropic",
+    "llama-cpp",
+    "llama-local",
+    "llama-local-qwen",
+    "vllm",
+    "ollama",
+  ];
+
+  const providers = [...grouped.keys()].sort((a, b) => {
+    const ai = providerOrder.indexOf(a);
+    const bi = providerOrder.indexOf(b);
+    if (ai === -1 && bi === -1) return a.localeCompare(b);
+    if (ai === -1) return 1;
+    if (bi === -1) return -1;
+    return ai - bi;
+  });
+
+  const lines: string[] = ["🏷️ Model aliases", "Use: /model <alias>", ""];
+
+  for (const provider of providers) {
+    lines.push(`${provider}:`);
+    const entries = (grouped.get(provider) ?? []).sort((a, b) => a.alias.localeCompare(b.alias));
+    for (const entry of entries) {
+      lines.push(`  ${entry.alias} → ${entry.modelId}`);
+    }
+    lines.push("");
+  }
+
+  lines.push(`Total: ${filtered.length}${query ? ` matched (${all.length} available)` : ""}`);
+  if (!query) {
+    lines.push("Tip: /a openai-codex");
+  }
+
+  return lines.join("\n");
+}
 
 function getSessionStorePath(agentId: string): string {
   const openclawPath = `/var/lib/clawdbot/.openclaw/agents/${agentId}/sessions/sessions.json`;
@@ -87,6 +187,214 @@ function readSessionStore(agentId: string): Record<string, any> {
   }
 }
 
+type SessionEntry = {
+  model?: string;
+  contextTokens?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  updatedAt?: number;
+};
+
+type RoomSessionSnapshot = {
+  roomId: string;
+  roomName: string;
+  agentId: string;
+  sessionKey?: string;
+  entry?: SessionEntry;
+  usedTokens?: number;
+  ctxTokens?: number;
+  updatedAt?: number;
+};
+
+type RuntimeSlot = {
+  id?: number;
+  n_ctx?: number;
+  is_processing?: boolean;
+  id_task?: number;
+  next_token?: Array<{
+    n_decoded?: number;
+    n_remain?: number;
+  }>;
+};
+
+function toFiniteNumber(value: unknown): number | undefined {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : undefined;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function formatTokenCount(tokens?: number): string {
+  if (tokens === undefined) return "n/a";
+  return Math.round(tokens).toLocaleString("en-US");
+}
+
+function formatAge(timestamp?: number): string {
+  if (!timestamp) return "n/a";
+
+  const deltaMs = Math.max(0, Date.now() - timestamp);
+  const seconds = Math.floor(deltaMs / 1000);
+
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+function compactModelName(model?: string): string {
+  if (!model) return "unknown";
+  return model.length > 48 ? `${model.slice(0, 47)}…` : model;
+}
+
+function findLatestRoomSession(agentId: string, roomId: string): Omit<RoomSessionSnapshot, "roomId" | "roomName" | "agentId"> {
+  const store = readSessionStore(agentId);
+  const roomIdLower = roomId.toLowerCase();
+
+  const matches = Object.entries(store)
+    .filter(([key]) => key.startsWith(`agent:${agentId}:`) && key.includes(roomIdLower))
+    .sort((a, b) => {
+      const aTs = toFiniteNumber((a[1] as SessionEntry)?.updatedAt) ?? 0;
+      const bTs = toFiniteNumber((b[1] as SessionEntry)?.updatedAt) ?? 0;
+      return bTs - aTs;
+    });
+
+  if (matches.length === 0) return {};
+
+  const [sessionKey, rawEntry] = matches[0];
+  const entry = (rawEntry ?? {}) as SessionEntry;
+  const inputTokens = toFiniteNumber(entry.inputTokens);
+  const outputTokens = toFiniteNumber(entry.outputTokens);
+  const totalTokens = toFiniteNumber(entry.totalTokens);
+
+  const usedTokens = inputTokens ?? totalTokens ?? ((inputTokens ?? 0) + (outputTokens ?? 0));
+
+  return {
+    sessionKey,
+    entry,
+    usedTokens,
+    ctxTokens: toFiniteNumber(entry.contextTokens),
+    updatedAt: toFiniteNumber(entry.updatedAt),
+  };
+}
+
+function collectRoomSessionSnapshots(roomsConfig: Record<string, RoomConfig>): RoomSessionSnapshot[] {
+  const snapshots: RoomSessionSnapshot[] = [];
+
+  for (const [roomId, roomConfig] of Object.entries(roomsConfig)) {
+    snapshots.push({
+      roomId,
+      roomName: roomConfig.roomName,
+      agentId: roomConfig.agentId,
+      ...findLatestRoomSession(roomConfig.agentId, roomId),
+    });
+  }
+
+  return snapshots.sort((a, b) => a.roomName.localeCompare(b.roomName));
+}
+
+const STALE_ROOM_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+function isStaleRoomSnapshot(snapshot: RoomSessionSnapshot): boolean {
+  if (!snapshot.updatedAt) return true;
+  return (Date.now() - snapshot.updatedAt) > STALE_ROOM_WINDOW_MS;
+}
+
+function getRoomFlags(snapshot: RoomSessionSnapshot): string[] {
+  if (!snapshot.sessionKey) return ["no-session"];
+
+  const flags: string[] = [];
+  if (isStaleRoomSnapshot(snapshot)) flags.push("stale");
+
+  const used = snapshot.usedTokens;
+  const cap = snapshot.ctxTokens;
+  if (used !== undefined && cap !== undefined && cap > 0 && used > cap) {
+    flags.push("store>cap");
+  }
+
+  return flags;
+}
+
+function getEffectiveUsedTokens(snapshot: RoomSessionSnapshot): number {
+  const used = snapshot.usedTokens;
+  const cap = snapshot.ctxTokens;
+  if (used === undefined) return 0;
+  if (cap !== undefined && cap > 0) return Math.min(used, cap);
+  return used;
+}
+
+function formatUsageBar(used: number, cap: number, width = 12): string {
+  if (!Number.isFinite(cap) || cap <= 0) {
+    return `[${"░".repeat(width)}]`;
+  }
+
+  const ratio = Math.max(0, Math.min(1, used / cap));
+  const filled = Math.round(ratio * width);
+  return `[${"█".repeat(filled)}${"░".repeat(width - filled)}]`;
+}
+
+function pickFocusRoomSnapshot(roomSnapshots: RoomSessionSnapshot[]): RoomSessionSnapshot | undefined {
+  const resolved = roomSnapshots.filter(s => s.sessionKey);
+  if (resolved.length === 0) return undefined;
+
+  const active = resolved.filter(s => !isStaleRoomSnapshot(s));
+  const pool = active.length > 0 ? active : resolved;
+
+  return [...pool].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0];
+}
+
+function formatRoomSnapshot(snapshot: RoomSessionSnapshot): string {
+  if (!snapshot.sessionKey) {
+    return `   ◻ ${snapshot.roomName.padEnd(14)} no active session entry`;
+  }
+
+  const used = snapshot.usedTokens;
+  const cap = snapshot.ctxTokens;
+  const flags = getRoomFlags(snapshot).filter(f => f !== "stale");
+  const stateIcon = isStaleRoomSnapshot(snapshot) ? "💤" : "✅";
+
+  if (used === undefined || cap === undefined || cap <= 0) {
+    const flagText = flags.length > 0 ? ` · ${flags.join(", ")}` : "";
+    return `   ${stateIcon} ${snapshot.roomName.padEnd(14)} ${formatTokenCount(used)} / ${formatTokenCount(cap)} tokens · ${formatAge(snapshot.updatedAt)}${flagText}`;
+  }
+
+  const effectiveUsed = Math.min(used, cap);
+  const ratio = (effectiveUsed / cap) * 100;
+  const flagText = flags.length > 0 ? ` · ${flags.join(", ")}` : "";
+
+  return `   ${stateIcon} ${snapshot.roomName.padEnd(14)} ${formatTokenCount(effectiveUsed)} / ${formatTokenCount(cap)} (${ratio.toFixed(1)}%) · ${formatAge(snapshot.updatedAt)}${flagText} · session-tag ${compactModelName(snapshot.entry?.model)}`;
+}
+
+function formatSlotLine(slot: RuntimeSlot, fallbackIndex: number): string {
+  const slotId = toFiniteNumber(slot.id) ?? fallbackIndex;
+  const slotCtx = toFiniteNumber(slot.n_ctx);
+  const taskId = toFiniteNumber(slot.id_task);
+  const state = slot.is_processing ? "busy" : "idle";
+
+  const nextToken = Array.isArray(slot.next_token) ? slot.next_token[0] : undefined;
+  const nDecoded = toFiniteNumber(nextToken?.n_decoded);
+  const nRemain = toFiniteNumber(nextToken?.n_remain);
+  const totalPlanned = nDecoded !== undefined && nRemain !== undefined ? nDecoded + nRemain : undefined;
+
+  const parts = [
+    `#${slotId}`,
+    `ctx ${formatTokenCount(slotCtx)}`,
+    state,
+  ];
+
+  if (taskId !== undefined) parts.push(`task ${taskId}`);
+  if (nDecoded !== undefined) {
+    parts.push(`gen ${formatTokenCount(nDecoded)}${totalPlanned !== undefined ? `/${formatTokenCount(totalPlanned)}` : ""}`);
+  }
+
+  return `   ${parts.join(" · ")}`;
+}
+
 function formatHelp(): string {
   const rooms = Object.values(getRooms()).map(r => r.roomName).join(", ");
   return `🤖 LocalBot Control
@@ -95,6 +403,8 @@ LocalBot runs on local GPU hardware with switchable inference backends. Use thes
 
 ━━━ Commands ━━━
 
+/a [filter]         Aliases — model alias quick list
+/aliases [filter]   Same as /a
 /lbs                Status — backend, GPU, model, slots
 /lbm                Models — list available models with specs
 /lbe                Endpoints — show all inference backends
@@ -124,6 +434,28 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
   const pluginConfig = (api.pluginConfig ?? {}) as PluginConfig;
   const endpointsPath = pluginConfig.endpointsPath ?? DEFAULT_ENDPOINTS_PATH;
 
+  const aliasesHandler = (ctx: { args?: string }) => {
+    return { text: formatAliases(ctx.args) };
+  };
+
+  // /a - Quick model alias list
+  api.registerCommand({
+    name: "a",
+    description: "Model alias quick list (optional filter)",
+    acceptsArgs: true,
+    requireAuth: true,
+    handler: aliasesHandler,
+  });
+
+  // /aliases - Verbose fallback for /a
+  api.registerCommand({
+    name: "aliases",
+    description: "List model aliases (optional filter)",
+    acceptsArgs: true,
+    requireAuth: true,
+    handler: aliasesHandler,
+  });
+
   // /lbh - Help
   api.registerCommand({
     name: "lbh",
@@ -147,7 +479,35 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
       const wStatus = await getWechslerStatus(wechslerConfig?.scriptPath);
       
       const modelsRegistry = loadModelsRegistry();
+      const activeEndpoint: ProbeResult | null = (registry && (wStatus.state === "llama-cpp" || wStatus.state === "vllm"))
+        ? await getActiveEndpoint(registry)
+        : null;
+
+      const runtimeCtxCap = toFiniteNumber(activeEndpoint?.contextWindow)
+        ?? toFiniteNumber((Array.isArray(wStatus.slots) && wStatus.slots.length > 0)
+          ? (wStatus.slots[0] as RuntimeSlot)?.n_ctx
+          : undefined);
+
+      const roomSnapshots = collectRoomSessionSnapshots(getRooms());
+      const focusSnapshot = pickFocusRoomSnapshot(roomSnapshots);
+
       const lines: string[] = ["🤖 LocalBot Status", ""];
+
+      // Quick context snapshot first (operator-first)
+      if (focusSnapshot && runtimeCtxCap && runtimeCtxCap > 0) {
+        const sessionCap = focusSnapshot.ctxTokens;
+        const effectiveCap = (sessionCap && sessionCap > 0)
+          ? Math.min(runtimeCtxCap, sessionCap)
+          : runtimeCtxCap;
+        const used = Math.min(focusSnapshot.usedTokens ?? 0, effectiveCap);
+        const ratio = (used / effectiveCap) * 100;
+        const age = formatAge(focusSnapshot.updatedAt);
+
+        lines.push(`⚡ Quick ctx (${focusSnapshot.roomName})`);
+        lines.push(`   ${formatTokenCount(used)} / ${formatTokenCount(effectiveCap)} (${ratio.toFixed(1)}%) ${formatUsageBar(used, effectiveCap)}`);
+        lines.push(`   runtime cap ${formatTokenCount(runtimeCtxCap)} · session cap ${formatTokenCount(sessionCap)} · ${age}`);
+        lines.push("");
+      }
 
       // GPU server state
       if (wStatus.state === "gpu-offline") {
@@ -166,33 +526,37 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
       }
 
       // Active model info (probe endpoint)
-      if (registry && (wStatus.state === "llama-cpp" || wStatus.state === "vllm")) {
-        const active = await getActiveEndpoint(registry);
-        if (active?.online) {
-          lines.push(`📦 Model: ${active.model}`);
-          
-          const meta = active.model && modelsRegistry 
-            ? findModelMetadata(active.model, modelsRegistry) 
-            : null;
-          
-          if (meta) {
-            lines.push(`   ${meta.name} (${meta.alias})`);
-            lines.push(`📐 Context: ${Math.round(meta.context / 1024)}k | ${meta.vramFit} VRAM`);
-            lines.push(`⚡ Speed: gen ${meta.speeds.genFresh}→${meta.speeds.genFilled} | pp ${meta.speeds.promptFresh}→${meta.speeds.promptFilled} tok/s`);
-          } else if (active.contextWindow) {
-            lines.push(`📐 Context: ${Math.round(active.contextWindow / 1024)}k tokens`);
-          }
+      if (activeEndpoint?.online) {
+        lines.push(`📦 Runtime model: ${activeEndpoint.model}`);
+
+        const meta = activeEndpoint.model && modelsRegistry
+          ? findModelMetadata(activeEndpoint.model, modelsRegistry)
+          : null;
+
+        if (meta) {
+          lines.push(`   ${meta.name} (${meta.alias})`);
+          lines.push(`📐 Profile ctx cap: ${formatTokenCount(meta.context)} tokens | ${meta.vramFit} VRAM`);
+          lines.push(`⚡ Speed: gen ${meta.speeds.genFresh}→${meta.speeds.genFilled} | pp ${meta.speeds.promptFresh}→${meta.speeds.promptFilled} tok/s`);
+        }
+
+        if (activeEndpoint.contextWindow) {
+          lines.push(`📐 Runtime ctx cap: ${formatTokenCount(activeEndpoint.contextWindow)} tokens (~${Math.round(activeEndpoint.contextWindow / 1024)}k)`);
         }
       }
 
-      // Slot info (llama-cpp only)
-      if (wStatus.state === "llama-cpp" && wStatus.slots && wStatus.slots.length > 0) {
-        const slot = wStatus.slots[0];
-        const ctxK = Math.round(slot.n_ctx / 1024);
-        lines.push(`🧠 Slot: ${ctxK}k ctx${slot.is_processing ? " (busy)" : " (idle)"}`);
+      // Runtime slot detail (GPU / llama-cpp)
+      if (wStatus.state === "llama-cpp") {
+        if (Array.isArray(wStatus.slots) && wStatus.slots.length > 0) {
+          lines.push(`🧠 GPU slots (${wStatus.slots.length})`);
+          for (const [index, slot] of wStatus.slots.entries()) {
+            lines.push(formatSlotLine((slot ?? {}) as RuntimeSlot, index));
+          }
+        } else {
+          lines.push("🧠 GPU slots: unavailable");
+        }
       }
 
-      // Saved slots
+      // Saved GPU slots
       if (wStatus.saved_slots.length > 0) {
         lines.push(`💾 Saved: ${wStatus.saved_slots.join(", ")}`);
       }
@@ -202,11 +566,16 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
       if (wStatus.local) {
         if (wStatus.local.state === "local-running") {
           lines.push("🟢 Local (CPU): running");
-          if (wStatus.local.slots && wStatus.local.slots.length > 0) {
-            const localSlot = wStatus.local.slots[0];
-            const localCtxK = Math.round(localSlot.n_ctx / 1024);
-            lines.push(`   🧠 ${localCtxK}k ctx, ~10 tok/s${localSlot.is_processing ? " (busy)" : ""}`);
+
+          if (Array.isArray(wStatus.local.slots) && wStatus.local.slots.length > 0) {
+            lines.push(`   Slots: ${wStatus.local.slots.length}`);
+            for (const [index, slot] of wStatus.local.slots.entries()) {
+              lines.push(formatSlotLine((slot ?? {}) as RuntimeSlot, index));
+            }
+          } else {
+            lines.push("   Slots: unavailable");
           }
+
           if (wStatus.local.saved_slots.length > 0) {
             lines.push(`   💾 Saved: ${wStatus.local.saved_slots.join(", ")}`);
           }
@@ -217,23 +586,52 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
         }
       }
 
-      // Session stats
+      // Room-level current context (OpenClaw session stores)
+      const resolvedRoomSnapshots = roomSnapshots.filter(s => s.sessionKey);
+      const activeRoomSnapshots = resolvedRoomSnapshots
+        .filter(s => !isStaleRoomSnapshot(s))
+        .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+      const staleRoomSnapshots = resolvedRoomSnapshots
+        .filter(s => isStaleRoomSnapshot(s))
+        .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+      const missingRoomSnapshots = roomSnapshots
+        .filter(s => !s.sessionKey)
+        .sort((a, b) => a.roomName.localeCompare(b.roomName));
+
       lines.push("");
-      let totalTokens = 0;
-      let sessionCount = 0;
-      for (const { agentId } of Object.values(getRooms())) {
-        const store = readSessionStore(agentId);
-        for (const [key, entry] of Object.entries(store)) {
-          if (key.startsWith(`agent:${agentId}:`)) {
-            const tokens = entry.totalTokens ?? ((entry.inputTokens ?? 0) + (entry.outputTokens ?? 0));
-            totalTokens += tokens;
-            sessionCount++;
-          }
+      lines.push("📚 Room ctx (details)");
+      lines.push("   used / cap = session prompt tokens / session context cap");
+      lines.push("   model shown per room = session-tag (may differ from runtime model)");
+
+      lines.push("   Active (<24h):");
+      if (activeRoomSnapshots.length === 0) {
+        lines.push("   (none)");
+      } else {
+        for (const snapshot of activeRoomSnapshots) {
+          lines.push(formatRoomSnapshot(snapshot));
         }
       }
-      if (sessionCount > 0) {
-        lines.push(`📊 Sessions: ${sessionCount} | ${Math.round(totalTokens / 1000)}k tokens`);
+
+      if (staleRoomSnapshots.length > 0) {
+        lines.push("   Stale (>=24h):");
+        for (const snapshot of staleRoomSnapshots) {
+          lines.push(formatRoomSnapshot(snapshot));
+        }
       }
+
+      if (missingRoomSnapshots.length > 0) {
+        lines.push("   No session entry:");
+        for (const snapshot of missingRoomSnapshots) {
+          lines.push(formatRoomSnapshot(snapshot));
+        }
+      }
+
+      lines.push("   Legend: 💤 stale >=24h, store>cap = historical counter exceeded cap");
+
+      const totalUsedTokens = activeRoomSnapshots.reduce((sum, s) => sum + getEffectiveUsedTokens(s), 0);
+
+      lines.push("");
+      lines.push(`📊 Rooms: ${resolvedRoomSnapshots.length}/${roomSnapshots.length} resolved | active (<24h): ${activeRoomSnapshots.length} | in-context ${formatTokenCount(totalUsedTokens)} tokens`);
 
       return { text: lines.join("\n") };
     },
