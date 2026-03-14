@@ -59,7 +59,7 @@ Show current inference status across runtime + room sessions:
 
 ⚡ Quick ctx (llmlab)
    20,703 / 98,304 (21.1%) [███░░░░░░░░░]
-   runtime cap 98,304 · session cap 131,072 · 6m ago
+   runtime cap 98,304 · session cap 131,072 · source transcript · 6m ago
 
 🟢 Backend: llama-cpp
 🖥️ GPU: GPU0: 96% | GPU1: 92%
@@ -75,13 +75,14 @@ Show current inference status across runtime + room sessions:
    #2 · ctx 120,064 · busy · task 1943
 
 📚 Room ctx (details)
-   used / cap = session prompt tokens / session context cap
+   used / cap = estimated prompt tokens / session context cap
+   source = transcript | totalTokens | inputTokens | input+output
    model shown per room = session-tag (may differ from runtime model)
    Active (<24h):
-   ✅ llmlab         20,703 / 131,072 (15.8%) · 6m ago · session-tag Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf
+   ✅ llmlab         20,703 / 131,072 (15.8%) · 6m ago · source transcript · session-tag Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf
    Stale (>=24h):
-   💤 llmlab-control 31,073 / 131,072 (23.7%) · 2d ago · session-tag GLM-4.7-Flash-UD-Q4_K_XL.gguf
-   Legend: 💤 stale >=24h, store>cap = historical counter exceeded cap
+   💤 llmlab-control 31,073 / 131,072 (23.7%) · 2d ago · source totalTokens · session-tag GLM-4.7-Flash-UD-Q4_K_XL.gguf
+   Legend: 💤 stale >=24h, counter-drift = non-transcript counter exceeded cap, ctx>cap = transcript-derived usage exceeded cap
 
 📊 Rooms: 6/6 resolved | active (<24h): 1 | in-context 20,703 tokens
 ```
@@ -91,8 +92,10 @@ Show current inference status across runtime + room sessions:
 - `session-tag ...` = model tag stored per room session entry (can differ from runtime model)
 - `Quick ctx` = most recently active room with `used / effective-cap`
 - `effective-cap = min(runtime ctx cap, session cap)`
+- `source ...` = token-source for occupancy estimate (`transcript` preferred, fallback to `totalTokens`, then legacy counters)
 - `💤` = room not updated in the last 24h (excluded from aggregate in-context total)
-- `store>cap` = stored counters exceeded cap; ratio display is clamped to cap
+- `counter-drift` = non-transcript counter exceeded cap
+- `ctx>cap` = transcript-derived estimate exceeded cap
 
 ---
 
@@ -118,12 +121,65 @@ Show available models from the model registry with specs.
 
 ---
 
-### `/lbm <alias>` — Reserved (not implemented)
+### `/lbm <alias> [flags]` — Switch Target Model
 
-Model switching through `/lbm <alias>` is currently **not implemented**.
-Use backend switch (`/lbw`) and native model controls where appropriate.
+Resolve alias to provider/backend, optionally switch backend, and apply model target updates.
 
-**Status:** Planned / reserved behavior
+**Auth:** Required  
+**Flags:**
+- `-bl` / `-bv` / `-bo` = backend shortcut (`llama-cpp` / `vllm` / `ollama`)
+- `-b l|v|o` = backend selector
+- `-e <endpoint-id>` = explicit endpoint
+- `--once` = non-persistent mode (default when mode flag omitted)
+- `--default` / `--set-default` = persist target model to configured default-update agents
+- `--scope active|all` = runtime session-tag touch scope (`active` default)
+- `--show-default` = show persisted defaults for target agents
+
+**Usage:**
+```text
+/lbm
+/lbm <alias> [--once] [--default|--set-default] [--scope active|all] [-bl|-bv|-bo|-b l|v|o] [-e <endpoint>]
+/lbm --show-default
+```
+
+**Behavior:**
+1. Resolve alias from OpenClaw model aliases
+2. Resolve backend:
+   - explicit backend flag (`-bl|-bv|-bo|-b`)
+   - else infer from `-e <endpoint>` when endpoint id is known
+   - else unresolved until alias disambiguation
+3. Resolve endpoint using deterministic order:
+   - alias override (`modelSwitch.routing.aliasOverrides`)
+   - backend default (`modelSwitch.routing.backendDefaults`)
+   - if exactly one endpoint exists for backend, use it
+   - otherwise fail with actionable ambiguity error
+4. Switch backend when needed (`llama-cpp`/`vllm` via wechsler)
+5. Apply runtime session model tags across configured target agents, using `--scope`:
+   - `active` (default): latest Matrix session key per mapped room only
+   - `all`: all session keys for each target agent
+6. If mode is `--default`/`--set-default`, update target agents' `model.primary` in gateway config with backup + atomic write
+
+**Mode semantics:**
+- `--once`:
+  - writes runtime session model tags for configured target agents per selected scope
+  - does **not** persist `model.primary`
+  - `/new` continues to follow current persisted defaults
+- `--default`:
+  - persists `model.primary` in `openclaw.json` for target agents
+  - applies to **new sessions only**
+  - existing session context is not rewritten
+
+**Runtime caveat:**
+- persisted default changes may require gateway/channel restart before `/new` consistently reflects the new value in Matrix monitor paths that cache config in-memory.
+
+**Actionable error behavior (examples):**
+- unknown alias: `❌ Unknown alias '<alias>'. Try /a <alias>`
+- unknown endpoint id: `❌ Endpoint '<id>' is unknown. Use /lbe to list valid endpoint ids.`
+- alias/backend mismatch: includes available backends and command hints (`/lbm <alias> -bl`, `/lbm <alias> -bv`, ...)
+- multi-backend ambiguity: lists each backend/model/endpoint path and suggests exact follow-up commands
+- endpoint ambiguity: requests `-e <endpoint>` and suggests `/lbe`
+- mode conflict: `❌ Choose one mode: --once or --default.`
+- invalid scope: `❌ Invalid scope. Use --scope active|all.`
 
 ---
 
@@ -338,7 +394,6 @@ All commands should:
 
 ## Future Enhancements
 
-- [ ] `/lbm` model switching (requires SSH to llama-cpp)
 - [ ] Move room mappings to config file
 - [ ] `/lbl` — show logs from inference server
 - [ ] `/lbq` — queue status (pending requests)

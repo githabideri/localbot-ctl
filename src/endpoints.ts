@@ -151,6 +151,7 @@ async function probeVllm(endpoint: EndpointConfig): Promise<ProbeResult> {
       endpoint,
       online: true,
       model: firstModel?.id ?? "unknown",
+      contextWindow: Number(firstModel?.max_model_len ?? 0) || undefined,
       latencyMs: Date.now() - start,
     };
   } catch (e: any) {

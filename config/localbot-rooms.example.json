@@ -3,7 +3,8 @@
     "!your-room-id:your-server.example": {
       "agentId": "localbot-main",
       "roomName": "main",
-      "publicReset": false
+      "publicReset": false,
+      "basePromptTokens": 8500
     },
     "!another-room:your-server.example": {
       "agentId": "localbot-public",

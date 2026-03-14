@@ -22,7 +22,14 @@ type PluginConfig = {
 };
 
 // Room config types
-type RoomConfig = { agentId: string; roomName: string; publicReset: boolean };
+type RoomConfig = {
+  agentId: string;
+  roomName: string;
+  publicReset: boolean;
+  // Optional static prompt baseline (e.g., /context list "System prompt (run)")
+  // used when provider usage counters are unavailable or zeroed.
+  basePromptTokens?: number;
+};
 type RoomsRegistry = {
   rooms: Record<string, RoomConfig>;
   meta?: { description?: string; lastUpdated?: string };
@@ -73,6 +80,53 @@ type AliasEntry = {
   modelId: string;
   provider: string;
 };
+
+type SwitchBackend = "llama-cpp" | "vllm" | "ollama";
+type LbmSessionScope = "active" | "all";
+
+type LbmParsedArgs = {
+  alias?: string;
+  backend?: SwitchBackend;
+  endpointId?: string;
+  scope: LbmSessionScope;
+  setDefault: boolean;
+  setOnce: boolean;
+  showDefault: boolean;
+  errors: string[];
+};
+
+type RoutingConfig = {
+  backendDefaults?: Partial<Record<SwitchBackend, string>>;
+  aliasOverrides?: Record<string, string>;
+  defaultUpdateTargets?: string[];
+};
+
+type GatewayAgentEntry = {
+  id?: string;
+  model?: {
+    primary?: string;
+    fallbacks?: string[];
+  };
+};
+
+type GatewayConfig = {
+  agents?: {
+    list?: GatewayAgentEntry[];
+    defaults?: {
+      models?: Record<string, { alias?: string; params?: Record<string, unknown> }>;
+    };
+  };
+};
+
+const DEFAULT_MODEL_SWITCH_TARGETS = [
+  "ht",
+  "localbot-fraktalia",
+  "localbot-labmaster",
+  "localbot-llmlab",
+  "localbot-planning",
+  "localbot-polis",
+  "localbot-schreiber",
+];
 
 function loadModelAliases(configPath: string = DEFAULT_GATEWAY_CONFIG_PATH): AliasEntry[] {
   try {
@@ -167,6 +221,304 @@ function formatAliases(queryRaw?: string): string {
   return lines.join("\n");
 }
 
+function parseSwitchBackend(raw?: string): SwitchBackend | undefined {
+  if (!raw) return undefined;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "l" || normalized === "llama" || normalized === "llama-cpp") return "llama-cpp";
+  if (normalized === "v" || normalized === "vllm") return "vllm";
+  if (normalized === "o" || normalized === "ollama") return "ollama";
+  return undefined;
+}
+
+function backendShortFlag(backend: SwitchBackend): string {
+  if (backend === "llama-cpp") return "-bl";
+  if (backend === "vllm") return "-bv";
+  return "-bo";
+}
+
+function parseLbmSessionScope(raw?: string): LbmSessionScope | undefined {
+  if (!raw) return undefined;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "active") return "active";
+  if (normalized === "all") return "all";
+  return undefined;
+}
+
+function lbmUsage(): string {
+  return [
+    "Usage:",
+    "/lbm",
+    "/lbm <alias> [--once] [--default|--set-default] [--scope active|all] [-bl|-bv|-bo|-b l|v|o] [-e <endpoint>]",
+    "/lbm --show-default",
+    "",
+    "Mode flags:",
+    "--once (default)  Non-persistent runtime target update for LocalBot+ht sessions.",
+    "--default         Persist agent defaults for new sessions (writes openclaw.json).",
+    "",
+    "Scope flags:",
+    "--scope active    Touch only latest mapped Matrix room sessions (default).",
+    "--scope all       Touch all session entries for target agents (includes cron/main/subagent).",
+  ].join("\n");
+}
+
+function parseLbmArgs(raw?: string): LbmParsedArgs {
+  const parsed: LbmParsedArgs = {
+    scope: "active",
+    setDefault: false,
+    setOnce: false,
+    showDefault: false,
+    errors: [],
+  };
+
+  const tokens = raw?.trim() ? raw.trim().split(/\s+/) : [];
+
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (!token) continue;
+
+    if (token === "--set-default" || token === "--default") {
+      parsed.setDefault = true;
+      continue;
+    }
+
+    if (token === "--once") {
+      parsed.setOnce = true;
+      continue;
+    }
+
+    if (token === "--show-default") {
+      parsed.showDefault = true;
+      continue;
+    }
+
+    if (token.startsWith("--scope=")) {
+      const value = token.slice("--scope=".length);
+      const scope = parseLbmSessionScope(value);
+      if (!scope) {
+        parsed.errors.push("Invalid scope. Use --scope active|all.");
+      } else {
+        parsed.scope = scope;
+      }
+      continue;
+    }
+
+    if (token === "--scope") {
+      const value = tokens[++i];
+      const scope = parseLbmSessionScope(value);
+      if (!value || !scope) {
+        parsed.errors.push("Invalid scope. Use --scope active|all.");
+      } else {
+        parsed.scope = scope;
+      }
+      continue;
+    }
+
+    if (token === "-bl") {
+      parsed.backend = "llama-cpp";
+      continue;
+    }
+
+    if (token === "-bv") {
+      parsed.backend = "vllm";
+      continue;
+    }
+
+    if (token === "-bo") {
+      parsed.backend = "ollama";
+      continue;
+    }
+
+    if (token === "-b") {
+      const value = tokens[++i];
+      const backend = parseSwitchBackend(value);
+      if (!value || !backend) {
+        parsed.errors.push("Invalid backend flag. Use -b l|v|o (or -bl/-bv/-bo).");
+      } else {
+        parsed.backend = backend;
+      }
+      continue;
+    }
+
+    if (token === "-e" || token === "--endpoint") {
+      const endpointId = tokens[++i];
+      if (!endpointId) {
+        parsed.errors.push("Missing endpoint id after -e/--endpoint.");
+      } else {
+        parsed.endpointId = endpointId;
+      }
+      continue;
+    }
+
+    if (token.startsWith("-")) {
+      parsed.errors.push(`Unknown flag: ${token}`);
+      continue;
+    }
+
+    if (!parsed.alias) {
+      parsed.alias = token.toLowerCase();
+    } else {
+      parsed.errors.push(`Unexpected extra argument: ${token}`);
+    }
+  }
+
+  if (parsed.showDefault && (parsed.alias || parsed.setDefault || parsed.setOnce || parsed.scope !== "active")) {
+    parsed.errors.push("--show-default cannot be combined with alias, --default, --once, or --scope.");
+  }
+
+  if (parsed.setDefault && parsed.setOnce) {
+    parsed.errors.push("Choose one mode: --once or --default.");
+  }
+
+  return parsed;
+}
+
+function getRoutingConfig(registry: EndpointsRegistry | null): RoutingConfig {
+  if (!registry) return {};
+  return ((registry as any).modelSwitch?.routing ?? (registry as any).wechsler?.routing ?? {}) as RoutingConfig;
+}
+
+function resolveCandidatesByAlias(alias: string, entries: AliasEntry[]): AliasEntry[] {
+  const query = alias.toLowerCase();
+  return entries.filter(entry => entry.alias.toLowerCase() === query);
+}
+
+function backendFromProvider(provider: string): SwitchBackend | undefined {
+  if (provider === "llama-cpp") return "llama-cpp";
+  if (provider === "vllm") return "vllm";
+  if (provider === "ollama") return "ollama";
+  return undefined;
+}
+
+function backendFromEndpointId(endpointId: string, registry: EndpointsRegistry | null): SwitchBackend | undefined {
+  if (!registry) return undefined;
+  const endpoint = registry.endpoints.find(e => e.id === endpointId);
+  return endpoint ? parseSwitchBackend(endpoint.type) : undefined;
+}
+
+function sortCandidates(candidates: AliasEntry[], routing: RoutingConfig): AliasEntry[] {
+  return [...candidates].sort((a, b) => {
+    const ab = backendFromProvider(a.provider);
+    const bb = backendFromProvider(b.provider);
+    const aEndpoint = ab ? routing.backendDefaults?.[ab] : undefined;
+    const bEndpoint = bb ? routing.backendDefaults?.[bb] : undefined;
+    if (aEndpoint && !bEndpoint) return -1;
+    if (!aEndpoint && bEndpoint) return 1;
+    return a.provider.localeCompare(b.provider);
+  });
+}
+
+function resolveEndpointId(
+  alias: string,
+  backend: SwitchBackend,
+  endpointIdArg: string | undefined,
+  registry: EndpointsRegistry | null,
+  routing: RoutingConfig
+): { endpointId?: string; error?: string } {
+  if (!registry) return { error: "Endpoints registry is unavailable." };
+
+  const endpointIdsByBackend = registry.endpoints
+    .filter(e => e.type === backend)
+    .map(e => e.id);
+
+  if (endpointIdArg) {
+    if (endpointIdsByBackend.includes(endpointIdArg)) {
+      return { endpointId: endpointIdArg };
+    }
+    return {
+      error: `Endpoint '${endpointIdArg}' is not a ${backend} endpoint. Available: ${endpointIdsByBackend.join(", ") || "(none)"}`,
+    };
+  }
+
+  const override = routing.aliasOverrides?.[alias.toLowerCase()];
+  if (override) {
+    if (endpointIdsByBackend.includes(override)) return { endpointId: override };
+    return { error: `Alias override for '${alias}' points to invalid ${backend} endpoint '${override}'.` };
+  }
+
+  const backendDefault = routing.backendDefaults?.[backend];
+  if (backendDefault) {
+    if (endpointIdsByBackend.includes(backendDefault)) return { endpointId: backendDefault };
+    return { error: `Backend default for ${backend} points to invalid endpoint '${backendDefault}'.` };
+  }
+
+  if (endpointIdsByBackend.length === 1) {
+    return { endpointId: endpointIdsByBackend[0] };
+  }
+
+  if (endpointIdsByBackend.length > 1) {
+    return {
+      error: `Multiple ${backend} endpoints available (${endpointIdsByBackend.join(", ")}). Use -e <endpoint>.`,
+    };
+  }
+
+  return { error: `No ${backend} endpoint configured.` };
+}
+
+function listBackendsForAlias(candidates: AliasEntry[]): SwitchBackend[] {
+  return [...new Set(candidates
+    .map(c => backendFromProvider(c.provider))
+    .filter((b): b is SwitchBackend => Boolean(b))
+  )];
+}
+
+function loadGatewayConfig(path: string = DEFAULT_GATEWAY_CONFIG_PATH): GatewayConfig | null {
+  try {
+    return JSON.parse(fs.readFileSync(path, "utf-8")) as GatewayConfig;
+  } catch (e) {
+    console.warn(`[localbot-ctl] Could not load gateway config from ${path}: ${e}`);
+    return null;
+  }
+}
+
+function writeJsonAtomicWithBackup(path: string, data: unknown): { backupPath: string } {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backupPath = `${path}.bak-${stamp}`;
+  fs.copyFileSync(path, backupPath);
+
+  const tempPath = `${path}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
+  fs.renameSync(tempPath, path);
+  return { backupPath };
+}
+
+function getDefaultTargetAgents(routing: RoutingConfig): string[] {
+  const configured = routing.defaultUpdateTargets?.filter(Boolean) ?? [];
+  return configured.length > 0 ? configured : DEFAULT_MODEL_SWITCH_TARGETS;
+}
+
+function updatePrimaryModelForAgents(
+  modelId: string,
+  targetAgents: string[],
+  gatewayPath: string = DEFAULT_GATEWAY_CONFIG_PATH
+): { changed: Array<{ agentId: string; before?: string; after: string }>; missing: string[]; backupPath?: string; error?: string } {
+  const gateway = loadGatewayConfig(gatewayPath);
+  if (!gateway?.agents?.list) {
+    return { changed: [], missing: targetAgents, error: "Could not load gateway agents list." };
+  }
+
+  const changed: Array<{ agentId: string; before?: string; after: string }> = [];
+  const missing: string[] = [];
+
+  for (const targetId of targetAgents) {
+    const entry = gateway.agents.list.find(agent => agent.id === targetId);
+    if (!entry) {
+      missing.push(targetId);
+      continue;
+    }
+    const before = entry.model?.primary;
+    if (!entry.model) entry.model = {};
+    entry.model.primary = modelId;
+    changed.push({ agentId: targetId, before, after: modelId });
+  }
+
+  let backupPath: string | undefined;
+  if (changed.length > 0) {
+    backupPath = writeJsonAtomicWithBackup(gatewayPath, gateway).backupPath;
+  }
+
+  return { changed, missing, backupPath };
+}
+
 function getSessionStorePath(agentId: string): string {
   const openclawPath = `/var/lib/clawdbot/.openclaw/agents/${agentId}/sessions/sessions.json`;
   const legacyPath = `/var/lib/clawdbot/.clawdbot/agents/${agentId}/sessions/sessions.json`;
@@ -187,7 +539,138 @@ function readSessionStore(agentId: string): Record<string, any> {
   }
 }
 
+type SessionTouchAgentSummary = {
+  agentId: string;
+  touched: number;
+  considered: number;
+  mappedRooms: number;
+  matchedRooms: number;
+  missingRooms: number;
+  storeMissing: boolean;
+};
+
+type SessionTouchSummary = {
+  scope: LbmSessionScope;
+  touchedSessions: number;
+  agents: SessionTouchAgentSummary[];
+};
+
+function getMappedRoomIdsByAgent(roomsConfig: Record<string, RoomConfig>): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  for (const [roomId, config] of Object.entries(roomsConfig)) {
+    const existing = map.get(config.agentId) ?? [];
+    existing.push(roomId.toLowerCase());
+    map.set(config.agentId, existing);
+  }
+  return map;
+}
+
+function listAgentSessionKeys(agentId: string, store: Record<string, unknown>): string[] {
+  return Object.keys(store).filter(key => key.startsWith(`agent:${agentId}:`));
+}
+
+function findLatestMatrixSessionKeyForRoom(
+  agentId: string,
+  roomId: string,
+  store: Record<string, unknown>
+): string | undefined {
+  const roomIdLower = roomId.toLowerCase();
+  return listAgentSessionKeys(agentId, store)
+    .filter(key => key.includes(":matrix:") && key.includes(roomIdLower))
+    .sort((a, b) => {
+      const aTs = toFiniteNumber((store[a] as SessionEntry | undefined)?.updatedAt) ?? 0;
+      const bTs = toFiniteNumber((store[b] as SessionEntry | undefined)?.updatedAt) ?? 0;
+      return bTs - aTs;
+    })[0];
+}
+
+function touchSessionEntriesForTargets(
+  modelRuntimeId: string,
+  targetAgents: string[],
+  scope: LbmSessionScope,
+  roomsConfig: Record<string, RoomConfig>
+): SessionTouchSummary {
+  const now = Date.now();
+  const roomIdsByAgent = getMappedRoomIdsByAgent(roomsConfig);
+  const result: SessionTouchSummary = {
+    scope,
+    touchedSessions: 0,
+    agents: [],
+  };
+
+  for (const agentId of targetAgents) {
+    const sessionStorePath = getSessionStorePath(agentId);
+    let store: Record<string, unknown>;
+
+    try {
+      const raw = fs.readFileSync(sessionStorePath, "utf-8");
+      store = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      result.agents.push({
+        agentId,
+        touched: 0,
+        considered: 0,
+        mappedRooms: 0,
+        matchedRooms: 0,
+        missingRooms: 0,
+        storeMissing: true,
+      });
+      continue;
+    }
+
+    let keysToTouch: string[] = [];
+    let mappedRooms = 0;
+    let matchedRooms = 0;
+    let missingRooms = 0;
+
+    if (scope === "all") {
+      keysToTouch = listAgentSessionKeys(agentId, store);
+    } else {
+      const mappedRoomIds = roomIdsByAgent.get(agentId) ?? [];
+      mappedRooms = mappedRoomIds.length;
+
+      for (const roomId of mappedRoomIds) {
+        const key = findLatestMatrixSessionKeyForRoom(agentId, roomId, store);
+        if (key) {
+          keysToTouch.push(key);
+          matchedRooms += 1;
+        } else {
+          missingRooms += 1;
+        }
+      }
+      keysToTouch = [...new Set(keysToTouch)];
+    }
+
+    let touched = 0;
+    for (const key of keysToTouch) {
+      const entry = store[key];
+      if (!entry || typeof entry !== "object") continue;
+      (entry as any).model = modelRuntimeId;
+      (entry as any).updatedAt = now;
+      touched += 1;
+    }
+
+    if (touched > 0) {
+      fs.writeFileSync(sessionStorePath, JSON.stringify(store, null, 2));
+    }
+
+    result.touchedSessions += touched;
+    result.agents.push({
+      agentId,
+      touched,
+      considered: keysToTouch.length,
+      mappedRooms,
+      matchedRooms,
+      missingRooms,
+      storeMissing: false,
+    });
+  }
+
+  return result;
+}
+
 type SessionEntry = {
+  sessionId?: string;
   model?: string;
   contextTokens?: number;
   inputTokens?: number;
@@ -196,6 +679,8 @@ type SessionEntry = {
   updatedAt?: number;
 };
 
+type ContextUsageSource = "transcript" | "totalTokens" | "inputTokens" | "input+output" | "estimate" | "none";
+
 type RoomSessionSnapshot = {
   roomId: string;
   roomName: string;
@@ -203,6 +688,8 @@ type RoomSessionSnapshot = {
   sessionKey?: string;
   entry?: SessionEntry;
   usedTokens?: number;
+  usageSource?: ContextUsageSource;
+  basePromptTokens?: number;
   ctxTokens?: number;
   updatedAt?: number;
 };
@@ -232,6 +719,134 @@ function formatTokenCount(tokens?: number): string {
   return Math.round(tokens).toLocaleString("en-US");
 }
 
+function formatUsageSource(source?: ContextUsageSource): string {
+  if (!source || source === "none") return "unknown";
+  return source;
+}
+
+function derivePromptTokensFromUsage(usage: unknown): number | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const u = usage as Record<string, unknown>;
+
+  const directPrompt =
+    toFiniteNumber(u.input) ??
+    toFiniteNumber(u.prompt_tokens) ??
+    toFiniteNumber(u.promptTokens) ??
+    toFiniteNumber(u.input_tokens) ??
+    toFiniteNumber(u.inputTokens);
+  if (directPrompt !== undefined) return directPrompt;
+
+  const total =
+    toFiniteNumber(u.totalTokens) ??
+    toFiniteNumber(u.total) ??
+    toFiniteNumber(u.total_tokens);
+  const output =
+    toFiniteNumber(u.output) ??
+    toFiniteNumber(u.output_tokens) ??
+    toFiniteNumber(u.outputTokens);
+  if (total !== undefined && output !== undefined) {
+    return Math.max(0, total - output);
+  }
+
+  return undefined;
+}
+
+function resolveTranscriptPath(agentId: string, sessionId?: string): string | undefined {
+  const normalized = sessionId?.trim();
+  if (!normalized) return undefined;
+
+  const openclawPath = `/var/lib/clawdbot/.openclaw/agents/${agentId}/sessions/${normalized}.jsonl`;
+  const legacyPath = `/var/lib/clawdbot/.clawdbot/agents/${agentId}/sessions/${normalized}.jsonl`;
+
+  try {
+    fs.accessSync(openclawPath);
+    return openclawPath;
+  } catch {
+    try {
+      fs.accessSync(legacyPath);
+      return legacyPath;
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+function readLatestPromptTokensFromTranscript(agentId: string, sessionId?: string): number | undefined {
+  const transcriptPath = resolveTranscriptPath(agentId, sessionId);
+  if (!transcriptPath) return undefined;
+
+  try {
+    const content = fs.readFileSync(transcriptPath, "utf-8");
+    if (!content.trim()) return undefined;
+    const lines = content.trim().split(/\n+/);
+
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line) continue;
+      try {
+        const parsed = JSON.parse(line) as {
+          message?: { usage?: unknown };
+          usage?: unknown;
+        };
+        const usage = parsed?.message?.usage ?? parsed?.usage;
+        const promptTokens = derivePromptTokensFromUsage(usage);
+        if (promptTokens !== undefined) return promptTokens;
+      } catch {
+        // Ignore malformed lines and continue scanning backwards.
+      }
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+}
+
+function estimatePromptTokensFromTranscript(agentId: string, sessionId?: string): number | undefined {
+  const transcriptPath = resolveTranscriptPath(agentId, sessionId);
+  if (!transcriptPath) return undefined;
+
+  try {
+    const content = fs.readFileSync(transcriptPath, "utf-8");
+    if (!content.trim()) return undefined;
+
+    const lines = content.trim().split(/\n+/);
+    // Keep this bounded and focused on recent conversational state.
+    const recentLines = lines.slice(-240);
+
+    let chars = 0;
+    for (const line of recentLines) {
+      if (!line) continue;
+      try {
+        const parsed = JSON.parse(line) as {
+          type?: string;
+          message?: { role?: string; content?: Array<{ type?: string; text?: string; thinking?: string }> };
+        };
+        if (parsed?.type !== "message") continue;
+        const role = parsed?.message?.role;
+        if (role !== "user" && role !== "assistant") continue;
+        const chunks = parsed?.message?.content ?? [];
+        for (const chunk of chunks) {
+          if (!chunk) continue;
+          if (chunk.type === "text" && typeof chunk.text === "string") {
+            chars += chunk.text.length;
+          } else if (chunk.type === "thinking" && typeof chunk.thinking === "string") {
+            chars += chunk.thinking.length;
+          }
+        }
+      } catch {
+        // Skip malformed lines.
+      }
+    }
+
+    if (chars <= 0) return undefined;
+    // Rough heuristic used for operator-facing estimate only.
+    return Math.round(chars / 4);
+  } catch {
+    return undefined;
+  }
+}
+
 function formatAge(timestamp?: number): string {
   if (!timestamp) return "n/a";
 
@@ -252,7 +867,7 @@ function compactModelName(model?: string): string {
   return model.length > 48 ? `${model.slice(0, 47)}…` : model;
 }
 
-function findLatestRoomSession(agentId: string, roomId: string): Omit<RoomSessionSnapshot, "roomId" | "roomName" | "agentId"> {
+function findLatestRoomSession(agentId: string, roomId: string, roomConfig?: RoomConfig): Omit<RoomSessionSnapshot, "roomId" | "roomName" | "agentId"> {
   const store = readSessionStore(agentId);
   const roomIdLower = roomId.toLowerCase();
 
@@ -264,20 +879,45 @@ function findLatestRoomSession(agentId: string, roomId: string): Omit<RoomSessio
       return bTs - aTs;
     });
 
-  if (matches.length === 0) return {};
+  if (matches.length === 0) return { basePromptTokens: toFiniteNumber(roomConfig?.basePromptTokens) };
 
   const [sessionKey, rawEntry] = matches[0];
   const entry = (rawEntry ?? {}) as SessionEntry;
   const inputTokens = toFiniteNumber(entry.inputTokens);
   const outputTokens = toFiniteNumber(entry.outputTokens);
   const totalTokens = toFiniteNumber(entry.totalTokens);
+  const transcriptPromptTokensRaw = readLatestPromptTokensFromTranscript(agentId, entry.sessionId);
+  const transcriptPromptTokens =
+    transcriptPromptTokensRaw !== undefined && transcriptPromptTokensRaw > 0
+      ? transcriptPromptTokensRaw
+      : undefined;
+  const estimatedTokens = estimatePromptTokensFromTranscript(agentId, entry.sessionId);
 
-  const usedTokens = inputTokens ?? totalTokens ?? ((inputTokens ?? 0) + (outputTokens ?? 0));
+  let usedTokens: number | undefined;
+  let usageSource: ContextUsageSource = "none";
+  if (transcriptPromptTokens !== undefined) {
+    usedTokens = transcriptPromptTokens;
+    usageSource = "transcript";
+  } else if (totalTokens !== undefined && totalTokens > 0) {
+    usedTokens = totalTokens;
+    usageSource = "totalTokens";
+  } else if (inputTokens !== undefined && inputTokens > 0) {
+    usedTokens = inputTokens;
+    usageSource = "inputTokens";
+  } else if ((inputTokens !== undefined && inputTokens > 0) || (outputTokens !== undefined && outputTokens > 0)) {
+    usedTokens = (inputTokens ?? 0) + (outputTokens ?? 0);
+    usageSource = "input+output";
+  } else if (estimatedTokens !== undefined) {
+    usedTokens = estimatedTokens;
+    usageSource = "estimate";
+  }
 
   return {
     sessionKey,
     entry,
     usedTokens,
+    usageSource,
+    basePromptTokens: toFiniteNumber(roomConfig?.basePromptTokens),
     ctxTokens: toFiniteNumber(entry.contextTokens),
     updatedAt: toFiniteNumber(entry.updatedAt),
   };
@@ -291,7 +931,7 @@ function collectRoomSessionSnapshots(roomsConfig: Record<string, RoomConfig>): R
       roomId,
       roomName: roomConfig.roomName,
       agentId: roomConfig.agentId,
-      ...findLatestRoomSession(roomConfig.agentId, roomId),
+      ...findLatestRoomSession(roomConfig.agentId, roomId, roomConfig),
     });
   }
 
@@ -311,21 +951,26 @@ function getRoomFlags(snapshot: RoomSessionSnapshot): string[] {
   const flags: string[] = [];
   if (isStaleRoomSnapshot(snapshot)) flags.push("stale");
 
-  const used = snapshot.usedTokens;
+  const used = getEffectiveUsedTokens(snapshot);
   const cap = snapshot.ctxTokens;
-  if (used !== undefined && cap !== undefined && cap > 0 && used > cap) {
-    flags.push("store>cap");
+  if (cap !== undefined && cap > 0 && used > cap) {
+    if (snapshot.usageSource === "transcript") {
+      flags.push("ctx>cap");
+    } else {
+      flags.push("counter-drift");
+    }
   }
 
   return flags;
 }
 
 function getEffectiveUsedTokens(snapshot: RoomSessionSnapshot): number {
-  const used = snapshot.usedTokens;
+  const dynamicUsed = snapshot.usedTokens ?? 0;
+  const base = snapshot.usageSource === "estimate" ? (snapshot.basePromptTokens ?? 0) : 0;
+  const effective = Math.max(0, dynamicUsed + base);
   const cap = snapshot.ctxTokens;
-  if (used === undefined) return 0;
-  if (cap !== undefined && cap > 0) return Math.min(used, cap);
-  return used;
+  if (cap !== undefined && cap > 0) return Math.min(effective, cap);
+  return effective;
 }
 
 function formatUsageBar(used: number, cap: number, width = 12): string {
@@ -357,17 +1002,20 @@ function formatRoomSnapshot(snapshot: RoomSessionSnapshot): string {
   const cap = snapshot.ctxTokens;
   const flags = getRoomFlags(snapshot).filter(f => f !== "stale");
   const stateIcon = isStaleRoomSnapshot(snapshot) ? "💤" : "✅";
+  const sourceSuffix = snapshot.usageSource === "estimate"
+    ? ` (base ${formatTokenCount(snapshot.basePromptTokens)} + dyn ${formatTokenCount(snapshot.usedTokens)})`
+    : "";
 
   if (used === undefined || cap === undefined || cap <= 0) {
     const flagText = flags.length > 0 ? ` · ${flags.join(", ")}` : "";
-    return `   ${stateIcon} ${snapshot.roomName.padEnd(14)} ${formatTokenCount(used)} / ${formatTokenCount(cap)} tokens · ${formatAge(snapshot.updatedAt)}${flagText}`;
+    return `   ${stateIcon} ${snapshot.roomName.padEnd(14)} ${formatTokenCount(getEffectiveUsedTokens(snapshot))} / ${formatTokenCount(cap)} tokens · ${formatAge(snapshot.updatedAt)} · source ${formatUsageSource(snapshot.usageSource)}${sourceSuffix}${flagText}`;
   }
 
-  const effectiveUsed = Math.min(used, cap);
+  const effectiveUsed = Math.min(getEffectiveUsedTokens(snapshot), cap);
   const ratio = (effectiveUsed / cap) * 100;
   const flagText = flags.length > 0 ? ` · ${flags.join(", ")}` : "";
 
-  return `   ${stateIcon} ${snapshot.roomName.padEnd(14)} ${formatTokenCount(effectiveUsed)} / ${formatTokenCount(cap)} (${ratio.toFixed(1)}%) · ${formatAge(snapshot.updatedAt)}${flagText} · session-tag ${compactModelName(snapshot.entry?.model)}`;
+  return `   ${stateIcon} ${snapshot.roomName.padEnd(14)} ${formatTokenCount(effectiveUsed)} / ${formatTokenCount(cap)} (${ratio.toFixed(1)}%) · ${formatAge(snapshot.updatedAt)} · source ${formatUsageSource(snapshot.usageSource)}${sourceSuffix}${flagText} · session-tag ${compactModelName(snapshot.entry?.model)}`;
 }
 
 function formatSlotLine(slot: RuntimeSlot, fallbackIndex: number): string {
@@ -405,13 +1053,21 @@ LocalBot runs on local GPU hardware with switchable inference backends. Use thes
 
 /a [filter]         Aliases — model alias quick list
 /aliases [filter]   Same as /a
-/lbs                Status — backend, GPU, model, slots
-/lbm                Models — list available models with specs
+/lbs [full]         Status — compact by default; use 'full' for detailed slots/rooms
+/lbm [alias] ...    Models — list/switch (--once|--default)
 /lbe                Endpoints — show all inference backends
-/lbw <backend>      Switch — llama-cpp | vllm | stop
+/lbw <arg>          Switch/status — llama-cpp | vllm | stop | status
 /lbp                Benchmark — test active endpoint speed
 /lbn <room>         Reset — clear session context
 /lbh                This help
+
+━━━ Model Switch Modes ━━━
+
+▸ --once (default) — runtime session-tag update only (non-persistent)
+▸ --default        — persist model.primary for LocalBot+ht target agents
+▸ /lbm --show-default — inspect persisted defaults
+▸ --scope active   — latest mapped Matrix sessions only (default)
+▸ --scope all      — includes cron/main/subagent session entries
 
 ━━━ Backends ━━━
 
@@ -471,17 +1127,36 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
   api.registerCommand({
     name: "lbs",
     description: "LocalBot status - backend, GPU, model",
-    acceptsArgs: false,
+    acceptsArgs: true,
     requireAuth: true,
-    handler: async () => {
+    handler: async (ctx) => {
+      const modeRaw = ctx.args?.trim().toLowerCase();
+      const verbose = modeRaw === "full" || modeRaw === "verbose" || modeRaw === "all" || modeRaw === "--full";
       const registry = loadEndpointsRegistry(endpointsPath);
       const wechslerConfig = (registry as any)?.wechsler as WechslerConfig | undefined;
       const wStatus = await getWechslerStatus(wechslerConfig?.scriptPath);
       
       const modelsRegistry = loadModelsRegistry();
-      const activeEndpoint: ProbeResult | null = (registry && (wStatus.state === "llama-cpp" || wStatus.state === "vllm"))
-        ? await getActiveEndpoint(registry)
-        : null;
+      const managedEndpointIds = new Set(
+        (wechslerConfig?.managedEndpoints ?? [])
+          .map(id => id.trim())
+          .filter(id => id.length > 0)
+      );
+      let activeEndpoint: ProbeResult | null = null;
+      if (registry) {
+        const probes = await probeAllEndpoints(registry);
+        activeEndpoint = probes
+          .filter(result => result.online)
+          .filter(result => {
+            if (managedEndpointIds.size > 0) return managedEndpointIds.has(result.endpoint.id);
+            return result.endpoint.type === "llama-cpp" || result.endpoint.type === "vllm";
+          })
+          .sort((a, b) => a.endpoint.priority - b.endpoint.priority)[0] ?? null;
+      }
+      const probedBackend = activeEndpoint?.endpoint.type;
+      const hasLiveManagedGpuEndpoint = probedBackend === "llama-cpp" || probedBackend === "vllm";
+      const sourceOfTruthBackend = wStatus.source_of_truth?.backend;
+      const backendLabel = hasLiveManagedGpuEndpoint ? probedBackend : (wStatus.active_backend || "unknown");
 
       const runtimeCtxCap = toFiniteNumber(activeEndpoint?.contextWindow)
         ?? toFiniteNumber((Array.isArray(wStatus.slots) && wStatus.slots.length > 0)
@@ -494,34 +1169,63 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
       const lines: string[] = ["🤖 LocalBot Status", ""];
 
       // Quick context snapshot first (operator-first)
-      if (focusSnapshot && runtimeCtxCap && runtimeCtxCap > 0) {
+      if (focusSnapshot) {
         const sessionCap = focusSnapshot.ctxTokens;
-        const effectiveCap = (sessionCap && sessionCap > 0)
-          ? Math.min(runtimeCtxCap, sessionCap)
-          : runtimeCtxCap;
-        const used = Math.min(focusSnapshot.usedTokens ?? 0, effectiveCap);
-        const ratio = (used / effectiveCap) * 100;
-        const age = formatAge(focusSnapshot.updatedAt);
+        const capCandidate = runtimeCtxCap ?? (sessionCap && sessionCap > 0 ? sessionCap : undefined);
 
-        lines.push(`⚡ Quick ctx (${focusSnapshot.roomName})`);
-        lines.push(`   ${formatTokenCount(used)} / ${formatTokenCount(effectiveCap)} (${ratio.toFixed(1)}%) ${formatUsageBar(used, effectiveCap)}`);
-        lines.push(`   runtime cap ${formatTokenCount(runtimeCtxCap)} · session cap ${formatTokenCount(sessionCap)} · ${age}`);
-        lines.push("");
+        if (capCandidate && capCandidate > 0) {
+          const effectiveCap = (sessionCap && sessionCap > 0)
+            ? Math.min(capCandidate, sessionCap)
+            : capCandidate;
+          const used = Math.min(getEffectiveUsedTokens(focusSnapshot), effectiveCap);
+          const ratio = (used / effectiveCap) * 100;
+          const age = formatAge(focusSnapshot.updatedAt);
+
+          lines.push(`⚡ Quick ctx (${focusSnapshot.roomName})`);
+          lines.push(`   ${formatTokenCount(used)} / ${formatTokenCount(effectiveCap)} (${ratio.toFixed(1)}%) ${formatUsageBar(used, effectiveCap)}`);
+          const sourceSuffix = focusSnapshot.usageSource === "estimate"
+            ? ` (base ${formatTokenCount(focusSnapshot.basePromptTokens)} + dyn ${formatTokenCount(focusSnapshot.usedTokens)})`
+            : "";
+          lines.push(`   runtime cap ${runtimeCtxCap ? formatTokenCount(runtimeCtxCap) : "unknown"} · session cap ${sessionCap ? formatTokenCount(sessionCap) : "unknown"} · source ${formatUsageSource(focusSnapshot.usageSource)}${sourceSuffix} · ${age}`);
+          lines.push("");
+        }
       }
 
       // GPU server state
       if (wStatus.state === "gpu-offline") {
-        lines.push("🔴 GPU server offline");
-        lines.push("   Use /lbw llama-cpp or /lbw vllm to start");
+        if (hasLiveManagedGpuEndpoint) {
+          lines.push("🟡 Wechsler reports GPU offline, but managed endpoint is reachable");
+          lines.push(`🟢 Backend: ${backendLabel}`);
+          lines.push("   /lbw state may be stale; endpoint probe confirms runtime is live");
+        } else {
+          lines.push("🔴 GPU server offline");
+          lines.push("   Use /lbw llama-cpp or /lbw vllm to start");
+        }
       } else if (wStatus.state === "gpu-idle") {
-        lines.push("🟡 GPU server up, no backend running");
-        lines.push("   Use /lbw llama-cpp or /lbw vllm to start");
+        if (hasLiveManagedGpuEndpoint) {
+          lines.push("🟡 Wechsler reports GPU idle, but managed endpoint is reachable");
+          lines.push(`🟢 Backend: ${backendLabel}`);
+          lines.push("   /lbw state may be stale; endpoint probe confirms runtime is live");
+        } else {
+          lines.push("🟡 GPU server up, no backend running");
+          lines.push("   Use /lbw llama-cpp or /lbw vllm to start");
+        }
+      } else if (wStatus.state === "unknown" && hasLiveManagedGpuEndpoint) {
+        lines.push("🟡 Wechsler status unavailable; falling back to endpoint probe");
+        lines.push(`🟢 Backend: ${backendLabel}`);
       } else {
-        lines.push(`🟢 Backend: ${wStatus.active_backend}`);
+        lines.push(`🟢 Backend: ${backendLabel}`);
         
         // GPU memory
         if (wStatus.gpu_memory) {
           lines.push(`🖥️ GPU: ${formatGpuMemory(wStatus.gpu_memory)}`);
+        }
+      }
+
+      if (sourceOfTruthBackend) {
+        lines.push(`🧭 Source-of-truth: ${sourceOfTruthBackend}`);
+        if ((backendLabel === "llama-cpp" || backendLabel === "vllm") && sourceOfTruthBackend !== "unknown" && sourceOfTruthBackend !== "none" && sourceOfTruthBackend !== backendLabel) {
+          lines.push("⚠️ Source-of-truth differs from live probe; consider /lbw stop then /lbw <backend> to reconcile");
         }
       }
 
@@ -533,23 +1237,27 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
           ? findModelMetadata(activeEndpoint.model, modelsRegistry)
           : null;
 
-        if (meta) {
+        if (meta && verbose) {
           lines.push(`   ${meta.name} (${meta.alias})`);
           lines.push(`📐 Profile ctx cap: ${formatTokenCount(meta.context)} tokens | ${meta.vramFit} VRAM`);
           lines.push(`⚡ Speed: gen ${meta.speeds.genFresh}→${meta.speeds.genFilled} | pp ${meta.speeds.promptFresh}→${meta.speeds.promptFilled} tok/s`);
         }
 
-        if (activeEndpoint.contextWindow) {
-          lines.push(`📐 Runtime ctx cap: ${formatTokenCount(activeEndpoint.contextWindow)} tokens (~${Math.round(activeEndpoint.contextWindow / 1024)}k)`);
-        }
+        const runtimeCapLine = activeEndpoint.contextWindow
+          ? `${formatTokenCount(activeEndpoint.contextWindow)} tokens (~${Math.round(activeEndpoint.contextWindow / 1024)}k)`
+          : (meta ? `${formatTokenCount(meta.context)} tokens (profile)` : "unknown");
+        lines.push(`📐 Runtime ctx cap: ${runtimeCapLine}`);
       }
 
       // Runtime slot detail (GPU / llama-cpp)
       if (wStatus.state === "llama-cpp") {
         if (Array.isArray(wStatus.slots) && wStatus.slots.length > 0) {
-          lines.push(`🧠 GPU slots (${wStatus.slots.length})`);
-          for (const [index, slot] of wStatus.slots.entries()) {
-            lines.push(formatSlotLine((slot ?? {}) as RuntimeSlot, index));
+          const busySlots = wStatus.slots.filter(slot => Boolean((slot as RuntimeSlot | undefined)?.is_processing)).length;
+          lines.push(`🧠 GPU slots: ${busySlots}/${wStatus.slots.length} busy`);
+          if (verbose) {
+            for (const [index, slot] of wStatus.slots.entries()) {
+              lines.push(formatSlotLine((slot ?? {}) as RuntimeSlot, index));
+            }
           }
         } else {
           lines.push("🧠 GPU slots: unavailable");
@@ -565,18 +1273,19 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
       lines.push("");
       if (wStatus.local) {
         if (wStatus.local.state === "local-running") {
-          lines.push("🟢 Local (CPU): running");
-
           if (Array.isArray(wStatus.local.slots) && wStatus.local.slots.length > 0) {
-            lines.push(`   Slots: ${wStatus.local.slots.length}`);
-            for (const [index, slot] of wStatus.local.slots.entries()) {
-              lines.push(formatSlotLine((slot ?? {}) as RuntimeSlot, index));
+            const busyLocalSlots = wStatus.local.slots.filter(slot => Boolean((slot as RuntimeSlot | undefined)?.is_processing)).length;
+            lines.push(`🟢 Local (CPU): running · ${busyLocalSlots}/${wStatus.local.slots.length} busy`);
+            if (verbose) {
+              for (const [index, slot] of wStatus.local.slots.entries()) {
+                lines.push(formatSlotLine((slot ?? {}) as RuntimeSlot, index));
+              }
             }
           } else {
-            lines.push("   Slots: unavailable");
+            lines.push("🟢 Local (CPU): running · slots unavailable");
           }
 
-          if (wStatus.local.saved_slots.length > 0) {
+          if (verbose && wStatus.local.saved_slots.length > 0) {
             lines.push(`   💾 Saved: ${wStatus.local.saved_slots.join(", ")}`);
           }
         } else if (wStatus.local.state === "local-offline") {
@@ -598,37 +1307,58 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
         .filter(s => !s.sessionKey)
         .sort((a, b) => a.roomName.localeCompare(b.roomName));
 
-      lines.push("");
-      lines.push("📚 Room ctx (details)");
-      lines.push("   used / cap = session prompt tokens / session context cap");
-      lines.push("   model shown per room = session-tag (may differ from runtime model)");
-
-      lines.push("   Active (<24h):");
-      if (activeRoomSnapshots.length === 0) {
-        lines.push("   (none)");
-      } else {
-        for (const snapshot of activeRoomSnapshots) {
-          lines.push(formatRoomSnapshot(snapshot));
-        }
-      }
-
-      if (staleRoomSnapshots.length > 0) {
-        lines.push("   Stale (>=24h):");
-        for (const snapshot of staleRoomSnapshots) {
-          lines.push(formatRoomSnapshot(snapshot));
-        }
-      }
-
-      if (missingRoomSnapshots.length > 0) {
-        lines.push("   No session entry:");
-        for (const snapshot of missingRoomSnapshots) {
-          lines.push(formatRoomSnapshot(snapshot));
-        }
-      }
-
-      lines.push("   Legend: 💤 stale >=24h, store>cap = historical counter exceeded cap");
-
       const totalUsedTokens = activeRoomSnapshots.reduce((sum, s) => sum + getEffectiveUsedTokens(s), 0);
+
+      lines.push("");
+      if (verbose) {
+        lines.push("📚 Room ctx (full)");
+        lines.push("   used / cap = estimated prompt tokens / session context cap");
+        lines.push("   source = transcript | totalTokens | inputTokens | input+output | estimate");
+        lines.push("   model shown per room = session-tag (may differ from runtime model)");
+
+        lines.push("   Active (<24h):");
+        if (activeRoomSnapshots.length === 0) {
+          lines.push("   (none)");
+        } else {
+          for (const snapshot of activeRoomSnapshots) {
+            lines.push(formatRoomSnapshot(snapshot));
+          }
+        }
+
+        if (staleRoomSnapshots.length > 0) {
+          lines.push("   Stale (>=24h):");
+          for (const snapshot of staleRoomSnapshots) {
+            lines.push(formatRoomSnapshot(snapshot));
+          }
+        }
+
+        if (missingRoomSnapshots.length > 0) {
+          lines.push("   No session entry:");
+          for (const snapshot of missingRoomSnapshots) {
+            lines.push(formatRoomSnapshot(snapshot));
+          }
+        }
+
+        lines.push("   Legend: 💤 stale >=24h, counter-drift = non-transcript counter exceeded cap, ctx>cap = transcript-derived usage exceeded cap");
+      } else {
+        lines.push("📚 Room ctx (compact)");
+        lines.push(`   active ${activeRoomSnapshots.length} · stale ${staleRoomSnapshots.length} · missing ${missingRoomSnapshots.length} · in-context ${formatTokenCount(totalUsedTokens)}`);
+        if (activeRoomSnapshots.length > 0) {
+          const s = activeRoomSnapshots[0];
+          const cap = s.ctxTokens && s.ctxTokens > 0 ? s.ctxTokens : runtimeCtxCap;
+          if (cap && cap > 0) {
+            const used = Math.min(getEffectiveUsedTokens(s), cap);
+            const ratio = (used / cap) * 100;
+            const estSuffix = s.usageSource === "estimate"
+              ? ` · est(base ${formatTokenCount(s.basePromptTokens)} + dyn ${formatTokenCount(s.usedTokens)})`
+              : "";
+            lines.push(`   latest ${s.roomName}: ${formatTokenCount(used)} / ${formatTokenCount(cap)} (${ratio.toFixed(1)}%) ${formatUsageBar(used, cap)}${estSuffix}`);
+          } else {
+            lines.push(`   latest ${s.roomName}: ${formatTokenCount(getEffectiveUsedTokens(s))} / unknown`);
+          }
+        }
+        lines.push("   Tip: /lbs full for detailed room/slot dump");
+      }
 
       lines.push("");
       lines.push(`📊 Rooms: ${resolvedRoomSnapshots.length}/${roomSnapshots.length} resolved | active (<24h): ${activeRoomSnapshots.length} | in-context ${formatTokenCount(totalUsedTokens)} tokens`);
@@ -637,20 +1367,52 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
     },
   });
 
-  // /lbm - List models
+  // /lbm - List/switch models
   api.registerCommand({
     name: "lbm",
-    description: "LocalBot models - list available models with specs",
-    acceptsArgs: false,
+    description: "LocalBot models - list, switch once, or persist default",
+    acceptsArgs: true,
     requireAuth: true,
-    handler: async () => {
+    handler: async (ctx) => {
       const modelsRegistry = loadModelsRegistry();
       if (!modelsRegistry || !modelsRegistry.models) {
         return { text: `❌ Could not load models registry` };
       }
 
-      // Get active model to mark it
       const endpointsRegistry = loadEndpointsRegistry(endpointsPath);
+      const routing = getRoutingConfig(endpointsRegistry);
+      const wechslerConfig = (endpointsRegistry as any)?.wechsler as WechslerConfig | undefined;
+      const parsed = parseLbmArgs(ctx.args);
+
+      if (ctx.args?.trim() === "--help") {
+        return {
+          text: [
+            "📦 /lbm usage",
+            "",
+            ...lbmUsage().split("\n"),
+            "",
+            "/lbm",
+            "  List models with metadata and mark active runtime match.",
+            "",
+            "Routing resolution order when endpoint is omitted:",
+            "  alias override -> backend default -> single endpoint -> error (ambiguous).",
+            "",
+            "Notes:",
+            "  • If alias exists on multiple backends, use -bl/-bv/-bo.",
+            "  • /new follows persisted defaults; use --default to change them.",
+            "  • Default scope is --scope active (latest mapped Matrix sessions only).",
+            "  • Use --scope all only for bulk rewrites (includes cron/subagent entries).",
+          ].join("\n"),
+        };
+      }
+
+      if (parsed.errors.length > 0) {
+        return {
+          text: `❌ ${parsed.errors[0]}\n\n${lbmUsage()}`,
+        };
+      }
+
+      // Get active model to mark it in list view
       let activeModel: string | null = null;
       if (endpointsRegistry) {
         const active = await getActiveEndpoint(endpointsRegistry);
@@ -659,29 +1421,232 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
         }
       }
 
-      const lines: string[] = ["📦 LocalBot Models", ""];
-      
-      // Sort by alias
-      const entries = Object.entries(modelsRegistry.models).sort((a, b) => 
-        a[1].alias.localeCompare(b[1].alias)
-      );
+      if (parsed.showDefault) {
+        const gateway = loadGatewayConfig();
+        if (!gateway?.agents?.list) {
+          return { text: "❌ Could not read gateway config defaults." };
+        }
 
-      for (const [modelId, meta] of entries) {
-        // Check if this is the active model
-        const modelKey = modelId.split("/").pop()?.replace(/\.gguf$/i, "").toLowerCase() ?? "";
-        const isActive = activeModel && (
-          activeModel.includes(modelKey) || modelKey.includes(activeModel)
-        );
+        const targets = getDefaultTargetAgents(routing);
+        const lines: string[] = ["🎯 Default model targets", ""];
+        for (const id of targets) {
+          const agent = gateway.agents.list.find(a => a.id === id);
+          if (!agent) {
+            lines.push(`❌ ${id}: missing agent`);
+            continue;
+          }
+          lines.push(`• ${id}: ${agent.model?.primary ?? "(unset)"}`);
+        }
+        return { text: lines.join("\n") };
+      }
+
+      if (!parsed.alias) {
+        const lines: string[] = ["📦 LocalBot Models", ""];
         
-        const marker = isActive ? " ⬅ active" : "";
-        lines.push(`▸ ${meta.alias} — ${meta.name}${marker}`);
-        lines.push(`  ${Math.round(meta.context / 1024)}k ctx | gen ${meta.speeds.genFresh}→${meta.speeds.genFilled} | pp ${meta.speeds.promptFresh}→${meta.speeds.promptFilled}`);
-        lines.push("");
+        const entries = Object.entries(modelsRegistry.models).sort((a, b) =>
+          a[1].alias.localeCompare(b[1].alias)
+        );
+
+        for (const [modelId, meta] of entries) {
+          const modelKey = modelId.split("/").pop()?.replace(/\.gguf$/i, "").toLowerCase() ?? "";
+          const isActive = activeModel && (
+            activeModel.includes(modelKey) || modelKey.includes(activeModel)
+          );
+          
+          const marker = isActive ? " ⬅ active" : "";
+          lines.push(`▸ ${meta.alias} — ${meta.name}${marker}`);
+          lines.push(`  ${Math.round(meta.context / 1024)}k ctx | gen ${meta.speeds.genFresh}→${meta.speeds.genFilled} | pp ${meta.speeds.promptFresh}→${meta.speeds.promptFilled}`);
+          lines.push("");
+        }
+
+        if (modelsRegistry.meta?.lastUpdated) {
+          lines.push(`Updated: ${modelsRegistry.meta.lastUpdated}`);
+        }
+
+        lines.push("Tip: /lbm <alias> --once -bl|-bv|-bo");
+        return { text: lines.join("\n") };
       }
 
-      if (modelsRegistry.meta?.lastUpdated) {
-        lines.push(`Updated: ${modelsRegistry.meta.lastUpdated}`);
+      const allAliases = loadModelAliases();
+      const candidatesAll = resolveCandidatesByAlias(parsed.alias, allAliases);
+      if (candidatesAll.length === 0) {
+        return { text: `❌ Unknown alias '${parsed.alias}'. Try /a ${parsed.alias}` };
       }
+
+      const selectionNotes: string[] = [];
+      const endpointImpliedBackend = (!parsed.backend && parsed.endpointId)
+        ? backendFromEndpointId(parsed.endpointId, endpointsRegistry)
+        : undefined;
+      let requestedBackend = parsed.backend ?? endpointImpliedBackend;
+
+      if (parsed.endpointId && !requestedBackend) {
+        return {
+          text: `❌ Endpoint '${parsed.endpointId}' is unknown. Use /lbe to list valid endpoint ids.`,
+        };
+      }
+
+      if (endpointImpliedBackend && !parsed.backend && parsed.endpointId) {
+        selectionNotes.push(`ℹ️ Endpoint '${parsed.endpointId}' implies backend '${endpointImpliedBackend}'.`);
+      }
+
+      const candidatesByBackend = requestedBackend
+        ? candidatesAll.filter(c => backendFromProvider(c.provider) === requestedBackend)
+        : candidatesAll;
+
+      if (candidatesByBackend.length === 0) {
+        const availableBackends = listBackendsForAlias(candidatesAll);
+        const suggestions = availableBackends.map(b => `/lbm ${parsed.alias} ${backendShortFlag(b)}`).join("   or   ");
+        return {
+          text: `❌ Alias '${parsed.alias}' is not available on backend '${requestedBackend}'. Available backends: ${availableBackends.join(", ") || "(none)"}${suggestions ? `\nTry: ${suggestions}` : ""}`,
+        };
+      }
+
+      let selected: AliasEntry | undefined = candidatesByBackend[0];
+      if (candidatesByBackend.length > 1 && !requestedBackend) {
+        const sorted = sortCandidates(candidatesByBackend, routing);
+        const resolved = sorted.map(candidate => {
+          const backend = backendFromProvider(candidate.provider);
+          if (!backend) return { candidate, backend, error: `provider '${candidate.provider}' is unsupported for /lbm` };
+          const endpoint = resolveEndpointId(parsed.alias!, backend, parsed.endpointId, endpointsRegistry, routing);
+          return {
+            candidate,
+            backend,
+            endpointId: endpoint.endpointId,
+            error: endpoint.error,
+          };
+        });
+
+        const routable = resolved.filter(item => Boolean(item.backend) && !item.error) as Array<{
+          candidate: AliasEntry;
+          backend: SwitchBackend;
+          endpointId?: string;
+          error?: string;
+        }>;
+        if (routable.length === 1) {
+          selected = routable[0].candidate;
+          requestedBackend = routable[0].backend;
+          selectionNotes.push(
+            `ℹ️ Auto-selected backend '${requestedBackend}' because it is the only routable option for alias '${parsed.alias}'.`
+          );
+        } else {
+          const lines = [
+            `⚠️ Alias '${parsed.alias}' exists on multiple backends.`,
+            "",
+            ...resolved.map(item => {
+              const backendLabel = item.backend ?? item.candidate.provider;
+              if (item.error) {
+                return `• ${backendLabel} → ${item.candidate.modelId} (unroutable: ${item.error})`;
+              }
+              return `• ${backendLabel}${item.endpointId ? ` @ ${item.endpointId}` : ""} → ${item.candidate.modelId}`;
+            }),
+            "",
+            ...listBackendsForAlias(sorted).map(b => `Use: /lbm ${parsed.alias} ${backendShortFlag(b)}${parsed.endpointId ? ` -e ${parsed.endpointId}` : ""}`),
+            "Tip: /lbe to inspect available endpoint ids.",
+          ];
+          return { text: lines.join("\n") };
+        }
+      }
+
+      if (candidatesByBackend.length > 1 && requestedBackend) {
+        const lines = [
+          `⚠️ Alias '${parsed.alias}' resolves to multiple models on backend '${requestedBackend}'.`,
+          ...candidatesByBackend.map(c => `• ${c.modelId}`),
+          "Use a backend-specific alias or clean up duplicate aliases in agents.defaults.models.",
+        ];
+        return { text: lines.join("\n") };
+      }
+
+      if (!selected) {
+        return { text: `❌ Could not resolve alias '${parsed.alias}' to a concrete model.` };
+      }
+
+      const selectedBackend = backendFromProvider(selected.provider);
+      if (!selectedBackend) {
+        return { text: `❌ Alias '${parsed.alias}' resolves to unsupported provider '${selected.provider}' for /lbm switching.` };
+      }
+
+      const endpointResolution = resolveEndpointId(parsed.alias, selectedBackend, parsed.endpointId, endpointsRegistry, routing);
+      if (endpointResolution.error) {
+        return {
+          text: `❌ ${endpointResolution.error}\nTry: /lbm ${parsed.alias} ${backendShortFlag(selectedBackend)} -e <endpoint>\nTip: /lbe to inspect endpoint ids.`,
+        };
+      }
+
+      const mode: "default" | "once" = parsed.setDefault ? "default" : "once";
+      const modeWasImplicit = mode === "once" && !parsed.setOnce;
+      const lines: string[] = [];
+      if (selectionNotes.length > 0) {
+        lines.push(...selectionNotes);
+      }
+
+      const wStatus = await getWechslerStatus(wechslerConfig?.scriptPath);
+      if ((selectedBackend === "llama-cpp" || selectedBackend === "vllm") && wStatus.state !== selectedBackend) {
+        const switched = await switchBackend(selectedBackend, wechslerConfig?.scriptPath);
+        if (!switched.success) {
+          return {
+            text: `❌ Backend switch failed (${selectedBackend})\n\n${switched.output}`,
+          };
+        }
+        lines.push(`✅ Backend switched to ${selectedBackend}`);
+      } else {
+        lines.push(`✅ Backend already ${selectedBackend}`);
+      }
+      lines.push(`🧭 Mode: ${mode === "default" ? "default (persistent)" : "once (non-persistent)"}`);
+
+      const modelRuntimeId = selected.modelId.split("/").slice(1).join("/") || selected.modelId;
+      const targets = getDefaultTargetAgents(routing);
+
+      if (parsed.setDefault) {
+        const result = updatePrimaryModelForAgents(selected.modelId, targets);
+        if (result.error) {
+          return { text: `❌ Default update failed: ${result.error}` };
+        }
+
+        lines.push(`✅ Default updated: ${selected.alias} → ${selected.modelId}`);
+        lines.push(`🎯 Endpoint: ${endpointResolution.endpointId ?? "n/a"}`);
+        lines.push(`🧩 Updated agents: ${result.changed.length}`);
+        for (const changed of result.changed) {
+          lines.push(`   • ${changed.agentId}: ${changed.before ?? "(unset)"} -> ${changed.after}`);
+        }
+        if (result.missing.length > 0) {
+          lines.push(`⚠️ Missing targets: ${result.missing.join(", ")}`);
+        }
+        if (result.backupPath) {
+          lines.push(`💾 Backup: ${result.backupPath}`);
+        }
+        lines.push("ℹ️ Applies to new sessions only; existing sessions keep current context.");
+        lines.push("ℹ️ Matrix/gateway runtime may require /restart before /new reflects persisted defaults.");
+      } else {
+        lines.push(`✅ Once target selected: ${selected.alias} → ${selected.modelId}`);
+        lines.push(`🎯 Endpoint: ${endpointResolution.endpointId ?? "n/a"}`);
+        lines.push(
+          modeWasImplicit
+            ? "ℹ️ Mode defaulted to --once. Use --default to persist for /new sessions."
+            : "ℹ️ Non-persistent mode. /new still follows persisted defaults."
+        );
+      }
+
+      // Apply runtime session model override for target agents to avoid manual agent prompting.
+      const roomsConfig = getRooms();
+      const touchSummary = touchSessionEntriesForTargets(modelRuntimeId, targets, parsed.scope, roomsConfig);
+      lines.push(`🗂️ Runtime session entries touched: ${touchSummary.touchedSessions} (scope: ${touchSummary.scope})`);
+      if (parsed.scope === "active") {
+        lines.push("ℹ️ Active scope touches only the latest Matrix session per mapped room.");
+      } else {
+        lines.push("⚠️ Scope all touched all session types (including cron/main/subagent).");
+      }
+      for (const stat of touchSummary.agents) {
+        if (stat.storeMissing) {
+          lines.push(`   • ${stat.agentId}: session store missing`);
+          continue;
+        }
+        if (parsed.scope === "active") {
+          lines.push(`   • ${stat.agentId}: touched ${stat.touched} (rooms ${stat.matchedRooms}/${stat.mappedRooms}${stat.missingRooms > 0 ? `, missing ${stat.missingRooms}` : ""})`);
+        } else {
+          lines.push(`   • ${stat.agentId}: touched ${stat.touched}/${stat.considered}`);
+        }
+      }
+      lines.push(`📍 Scope: ${targets.length} target agents (${targets.join(", ")})`);
 
       return { text: lines.join("\n") };
     },
@@ -838,17 +1803,32 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
     requireAuth: true,
     handler: async (ctx) => {
       const target = ctx.args?.trim().toLowerCase();
-      
-      if (!target || !["llama-cpp", "vllm", "stop"].includes(target)) {
+      const valid = ["llama-cpp", "vllm", "stop", "status", "current"];
+
+      if (!target || !valid.includes(target)) {
         const wStatus = await getWechslerStatus(
           ((loadEndpointsRegistry(endpointsPath) as any)?.wechsler as WechslerConfig | undefined)?.scriptPath
         );
         return {
-          text: `Usage: /lbw <llama-cpp|vllm|stop>\n\nCurrent: ${wStatus.state}`,
+          text: `Usage: /lbw <llama-cpp|vllm|stop|status|current>\n\nCurrent: ${wStatus.state}`,
         };
       }
 
       const wechslerConfig = (loadEndpointsRegistry(endpointsPath) as any)?.wechsler as WechslerConfig | undefined;
+
+      if (target === "status" || target === "current") {
+        const status = await getWechslerStatus(wechslerConfig?.scriptPath);
+        const source = status.source_of_truth?.backend ?? "unknown";
+        const gpu = status.gpu_memory ? formatGpuMemory(status.gpu_memory) : "unknown";
+        return {
+          text: [
+            "🧭 Backend state",
+            `wechsler: ${status.state}`,
+            `source-of-truth: ${source}`,
+            `gpu: ${gpu}`,
+          ].join("\n"),
+        };
+      }
 
       if (target === "stop") {
         const result = await stopBackend(wechslerConfig?.scriptPath);

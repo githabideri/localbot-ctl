@@ -12,6 +12,11 @@ export type LocalStatus = {
 export type WechslerStatus = {
   state: WechslerState;
   active_backend: string;
+  source_of_truth?: {
+    backend?: string;
+    state_file?: string;
+    lock_file?: string;
+  };
   slots: any[] | null;
   saved_slots: string[];
   gpu_memory: { id: number; used_mib: number; total_mib: number }[] | null;
@@ -23,7 +28,7 @@ export type WechslerConfig = {
   managedEndpoints: string[];
 };
 
-const DEFAULT_SCRIPT = "/var/lib/clawdbot/workspace/wechsler-llm/wechsler.sh";
+const DEFAULT_SCRIPT = "/var/lib/clawdbot/workspace/plugins/localbot-ctl/ops/wechsler/wechsler.sh";
 
 /**
  * Run wechsler.sh with arguments, return stdout
@@ -45,16 +50,21 @@ function runWechsler(scriptPath: string, args: string[], timeoutMs = 180000): Pr
  */
 export async function getWechslerStatus(scriptPath?: string): Promise<WechslerStatus> {
   try {
-    const output = await runWechsler(scriptPath ?? DEFAULT_SCRIPT, ["status", "--json"], 15000);
+    const output = await runWechsler(scriptPath ?? DEFAULT_SCRIPT, ["status", "--json", "--fast"], 30000);
     return JSON.parse(output.trim()) as WechslerStatus;
-  } catch (e: any) {
-    return {
-      state: "unknown",
-      active_backend: "none",
-      slots: null,
-      saved_slots: [],
-      gpu_memory: null,
-    };
+  } catch (fastErr: any) {
+    try {
+      const output = await runWechsler(scriptPath ?? DEFAULT_SCRIPT, ["status", "--json"], 60000);
+      return JSON.parse(output.trim()) as WechslerStatus;
+    } catch (e: any) {
+      return {
+        state: "unknown",
+        active_backend: "none",
+        slots: null,
+        saved_slots: [],
+        gpu_memory: null,
+      };
+    }
   }
 }
 
