@@ -16,6 +16,23 @@ import {
   formatGpuMemory,
   type WechslerConfig,
 } from "./wechsler.js";
+import {
+  loadPowerConfig,
+  loadPowerState,
+  savePowerState,
+  touchActivity,
+  startGpuServer,
+  shutdownServer,
+  formatIdleStatus,
+  formatPowerStats,
+  checkHealth,
+  checkVllmHealth,
+  startIdleMonitor,
+  setStateFilePath,
+  getPowerStats,
+  resetSessionBaseline,
+  type PowerConfig,
+} from "./power.js";
 
 type PluginConfig = {
   endpointsPath?: string;
@@ -1061,6 +1078,14 @@ LocalBot runs on local GPU hardware with switchable inference backends. Use thes
 /lbn <room>         Reset — clear session context
 /lbh                This help
 
+━━━ Power Management ━━━
+
+/lbstart            Wake GPU server (WoL/webhook + boot + warmup)
+/lboff              Shutdown GPU server (admin only)
+/lbstay [on|off]    Toggle stay-online (skip auto-shutdown)
+/lbidle [set <min>] Show idle status / set timeout
+/lbpower [reset]    Power consumption stats / reset baseline
+
 ━━━ Model Switch Modes ━━━
 
 ▸ --once (default) — runtime session-tag update only (non-persistent)
@@ -1077,6 +1102,7 @@ LocalBot runs on local GPU hardware with switchable inference backends. Use thes
 
 GPU: only one runs at a time. Switching saves state automatically.
 CPU: always available independently.
+Auto-shutdown after idle period (configurable, default 30min).
 
 ━━━ Rooms ━━━
 ${rooms}
@@ -1937,4 +1963,196 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
       }
     },
   });
+
+  // ── Power Management Commands ──────────────────────────────────────────
+
+  const powerConfig = loadPowerConfig(endpointsPath);
+
+  // /lbstart - Wake GPU server
+  api.registerCommand({
+    name: "lbstart",
+    description: "Wake GPU server (WoL + boot + warmup)",
+    acceptsArgs: false,
+    requireAuth: true,
+    handler: async () => {
+      if (!powerConfig) {
+        return { text: "❌ Power management not configured. Add a 'power' section to inference-endpoints.json." };
+      }
+
+      touchActivity();
+
+      const result = await startGpuServer(powerConfig);
+      const lines = [
+        result.success ? "⚡ GPU Server Start" : "❌ GPU Server Start Failed",
+        "",
+        ...result.steps,
+      ];
+
+      if (result.cached) {
+        lines.push("", "Server was already running — activity timer refreshed.");
+      }
+
+      return { text: lines.join("\n") };
+    },
+  });
+
+  // /lboff - Shutdown GPU server (admin only)
+  api.registerCommand({
+    name: "lboff",
+    description: "Shutdown GPU server (admin only)",
+    acceptsArgs: false,
+    requireAuth: true,
+    handler: async (ctx) => {
+      if (!powerConfig) {
+        return { text: "❌ Power management not configured." };
+      }
+
+      if (!ctx.isAuthorizedSender) {
+        return { text: "❌ Only authorized users can shut down the GPU server." };
+      }
+
+      // Check if server is even online
+      const isOnline = await checkHealth(powerConfig.healthUrl);
+      if (!isOnline) {
+        return { text: "ℹ️ GPU server appears to be already offline." };
+      }
+
+      const result = await shutdownServer(powerConfig.sshHost);
+      if (result.success) {
+        const state = loadPowerState();
+        state.serverOnline = false;
+        state.lastShutdownTs = Date.now();
+        savePowerState(state);
+        return { text: "✅ GPU server shutdown initiated.\n🔌 wgpx15 powering off..." };
+      } else {
+        return { text: `❌ Shutdown failed: ${result.error}` };
+      }
+    },
+  });
+
+  // /lbstay - Toggle stay-online mode
+  api.registerCommand({
+    name: "lbstay",
+    description: "Toggle stay-online (skip auto-shutdown)",
+    acceptsArgs: true,
+    requireAuth: true,
+    handler: async (ctx) => {
+      if (!powerConfig) {
+        return { text: "❌ Power management not configured." };
+      }
+
+      if (!ctx.isAuthorizedSender) {
+        return { text: "❌ Only authorized users can toggle stay-online mode." };
+      }
+
+      const state = loadPowerState();
+      const arg = ctx.args?.trim().toLowerCase();
+
+      if (arg === "on" || arg === "true" || arg === "1") {
+        state.stayOnline = true;
+      } else if (arg === "off" || arg === "false" || arg === "0") {
+        state.stayOnline = false;
+        state.lastActivityTs = Date.now(); // Reset idle timer
+      } else if (!arg) {
+        // Toggle
+        state.stayOnline = !state.stayOnline;
+        if (!state.stayOnline) {
+          state.lastActivityTs = Date.now(); // Reset idle timer on disable
+        }
+      } else {
+        return { text: "Usage: /lbstay [on|off]" };
+      }
+
+      savePowerState(state);
+
+      if (state.stayOnline) {
+        return { text: "🔒 Stay-online: ON\nGPU server will not auto-shutdown until /lbstay off." };
+      } else {
+        const timeout = state.idleTimeoutMinutes || powerConfig.idleTimeoutMinutes;
+        return { text: `⏱️ Stay-online: OFF\nAuto-shutdown resumes (${timeout}min idle timeout, timer reset).` };
+      }
+    },
+  });
+
+  // /lbidle - Show idle status / set timeout
+  api.registerCommand({
+    name: "lbidle",
+    description: "Show idle status / set auto-shutdown timeout",
+    acceptsArgs: true,
+    requireAuth: true,
+    handler: async (ctx) => {
+      if (!powerConfig) {
+        return { text: "❌ Power management not configured." };
+      }
+
+      const arg = ctx.args?.trim().toLowerCase();
+
+      // /lbidle set <minutes>
+      if (arg?.startsWith("set")) {
+        if (!ctx.isAuthorizedSender) {
+          return { text: "❌ Only authorized users can change the idle timeout." };
+        }
+
+        const parts = arg.split(/\s+/);
+        const minutes = parseInt(parts[1], 10);
+        if (isNaN(minutes) || minutes < 5 || minutes > 1440) {
+          return { text: "Usage: /lbidle set <5-1440>\nMinutes until auto-shutdown." };
+        }
+
+        const state = loadPowerState();
+        state.idleTimeoutMinutes = minutes;
+        savePowerState(state);
+        return { text: `✅ Idle timeout set to ${minutes} minutes.` };
+      }
+
+      // /lbidle reset — reset activity timer
+      if (arg === "reset" || arg === "touch") {
+        touchActivity();
+        return { text: "✅ Activity timer reset." };
+      }
+
+      // Default: show status
+      return { text: formatIdleStatus(powerConfig) };
+    },
+  });
+
+  // /lbpower - Show power stats from Home Assistant
+  api.registerCommand({
+    name: "lbpower",
+    description: "Show power consumption stats",
+    acceptsArgs: true,
+    requireAuth: false,
+    handler: async (ctx) => {
+      if (!powerConfig) {
+        return { text: "❌ Power management not configured." };
+      }
+
+      const arg = ctx.args?.trim().toLowerCase();
+
+      // /lbpower reset — reset session baseline
+      if (arg === "reset") {
+        if (!ctx.isAuthorizedSender) {
+          return { text: "❌ Only authorized users can reset the energy baseline." };
+        }
+        const ok = await resetSessionBaseline(powerConfig);
+        if (ok) {
+          return { text: "✅ Session energy baseline reset to current reading." };
+        } else {
+          return { text: "❌ Failed to reset baseline. Check HA config (haUrl, haTokenFile, haBaselineEntity, haEnergyEntity)." };
+        }
+      }
+
+      // Default: show stats
+      const stats = await getPowerStats(powerConfig);
+      if (!stats) {
+        return { text: "ℹ️ Power monitoring not configured.\nAdd haUrl, haTokenFile, and haPowerEntity to the power config." };
+      }
+      return { text: formatPowerStats(stats) };
+    },
+  });
+
+  // Start idle monitor if power config exists and is enabled
+  if (powerConfig?.enabled) {
+    startIdleMonitor(powerConfig);
+  }
 }
