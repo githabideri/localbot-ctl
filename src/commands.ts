@@ -31,7 +31,10 @@ import {
   setStateFilePath,
   getPowerStats,
   resetSessionBaseline,
+  appendSessionEvent,
+  getLastStartEvent,
   type PowerConfig,
+  type SessionEvent,
 } from "./power.js";
 
 type PluginConfig = {
@@ -2020,10 +2023,28 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
       const result = await shutdownServer(powerConfig.sshHost);
       if (result.success) {
         const state = loadPowerState();
+
+        // Log session end
+        if (powerConfig.sessionLogPath && state.lastBootTs) {
+          const stats = await getPowerStats(powerConfig).catch(() => null);
+          const startEv = getLastStartEvent(powerConfig.sessionLogPath);
+          appendSessionEvent(powerConfig.sessionLogPath, {
+            event: "end",
+            sessionId: startEv?.sessionId ?? new Date().toISOString().split("T")[0],
+            timestamp: new Date().toISOString(),
+            unixTs: Math.floor(Date.now() / 1000),
+            energyKwh: stats?.totalEnergyKwh,
+            durationS: Math.round((Date.now() - state.lastBootTs) / 1000),
+            energyUsedKwh: startEv?.energyKwh && stats?.totalEnergyKwh
+              ? Math.round((stats.totalEnergyKwh - startEv.energyKwh) * 1000) / 1000
+              : undefined,
+          });
+        }
+
         state.serverOnline = false;
         state.lastShutdownTs = Date.now();
         savePowerState(state);
-        return { text: "✅ GPU server shutdown initiated.\n🔌 wgpx15 powering off..." };
+        return { text: "✅ GPU server shutdown initiated.\n🔌 Server powering off..." };
       } else {
         return { text: `❌ Shutdown failed: ${result.error}` };
       }

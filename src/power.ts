@@ -32,6 +32,10 @@ export type PowerConfig = {
   /** Enable power management */
   enabled: boolean;
 
+  // ── Optional: Session logging (JSONL) ──
+  /** Path to JSONL file for session event logging */
+  sessionLogPath?: string;
+
   // ── Optional: Home Assistant REST API for power monitoring ──
   /** HA base URL (e.g. http://100.x.x.x:8123) */
   haUrl?: string;
@@ -66,6 +70,48 @@ export type PowerStats = {
   socketState: string;
   timestamp: string;
 };
+
+// ── Session event logging (JSONL) ──────────────────────────────────────
+
+export type SessionEvent = {
+  event: "start" | "end";
+  sessionId: string;
+  timestamp: string;
+  unixTs: number;
+  energyKwh?: number;
+  powerW?: number;
+  durationS?: number;
+  energyUsedKwh?: number;
+  bootTimeS?: number;
+};
+
+function generateSessionId(): string {
+  const now = new Date();
+  const d = now.toISOString().split("T")[0];
+  const t = now.toTimeString().split(" ")[0].replace(/:/g, "");
+  return `${d}-${t}`;
+}
+
+export function appendSessionEvent(logPath: string, event: SessionEvent): void {
+  try {
+    const dir = logPath.substring(0, logPath.lastIndexOf("/"));
+    if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(logPath, JSON.stringify(event) + "\n");
+  } catch (e) {
+    console.error("[power] Failed to write session event:", e);
+  }
+}
+
+export function getLastStartEvent(logPath: string): { sessionId: string; energyKwh?: number } | null {
+  try {
+    const lines = fs.readFileSync(logPath, "utf-8").split("\n").filter(l => l.trim());
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const ev = JSON.parse(lines[i]) as SessionEvent;
+      if (ev.event === "start") return { sessionId: ev.sessionId, energyKwh: ev.energyKwh };
+    }
+  } catch { /* ignore */ }
+  return null;
+}
 
 // State file path — loaded from config, falls back to cwd-relative
 let stateFilePath = "power-state.json";
@@ -500,7 +546,23 @@ export async function startGpuServer(config: PowerConfig): Promise<StartResult> 
   finalState.bootInProgress = false;
   savePowerState(finalState);
 
-  steps.push(`🏁 Total boot time: ${Math.round((Date.now() - start) / 1000)}s`);
+  const totalS = Math.round((Date.now() - start) / 1000);
+  steps.push(`🏁 Total boot time: ${totalS}s`);
+
+  // Log session start event
+  if (config.sessionLogPath) {
+    const stats = await getPowerStats(config).catch(() => null);
+    appendSessionEvent(config.sessionLogPath, {
+      event: "start",
+      sessionId: generateSessionId(),
+      timestamp: new Date().toISOString(),
+      unixTs: Math.floor(Date.now() / 1000),
+      energyKwh: stats?.totalEnergyKwh,
+      powerW: stats?.currentPowerW,
+      bootTimeS: totalS,
+    });
+  }
+
   return { success: true, steps, totalMs: Date.now() - start, cached: false };
 }
 
@@ -598,6 +660,23 @@ async function idleMonitorTick(config: PowerConfig): Promise<void> {
       state.serverOnline = false;
       state.lastShutdownTs = Date.now();
       console.log("[power] Shutdown initiated by idle monitor");
+
+      // Log session end event
+      if (config.sessionLogPath && state.lastBootTs) {
+        const stats = await getPowerStats(config).catch(() => null);
+        const startStats = getLastStartEvent(config.sessionLogPath);
+        appendSessionEvent(config.sessionLogPath, {
+          event: "end",
+          sessionId: startStats?.sessionId ?? generateSessionId(),
+          timestamp: new Date().toISOString(),
+          unixTs: Math.floor(Date.now() / 1000),
+          energyKwh: stats?.totalEnergyKwh,
+          durationS: Math.round((Date.now() - state.lastBootTs) / 1000),
+          energyUsedKwh: startStats?.energyKwh && stats?.totalEnergyKwh
+            ? Math.round((stats.totalEnergyKwh - startStats.energyKwh) * 1000) / 1000
+            : undefined,
+        });
+      }
     } else {
       console.error(`[power] Auto-shutdown failed: ${result.error}`);
     }
@@ -705,6 +784,9 @@ export function loadPowerConfig(endpointsPath: string): PowerConfig | null {
       checkIntervalMinutes: Number(power.checkIntervalMinutes) || 5,
       warmupModel: power.warmupModel ? String(power.warmupModel) : undefined,
       enabled: power.enabled !== false,
+
+      // Session logging (optional)
+      sessionLogPath: power.sessionLogPath ? String(power.sessionLogPath) : undefined,
 
       // HA monitoring (all optional)
       haUrl: power.haUrl ? String(power.haUrl) : undefined,
