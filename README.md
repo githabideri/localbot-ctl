@@ -188,7 +188,7 @@ The plugin communicates with inference servers via their **HTTP APIs** (OpenAI-c
 
 ## Backend Switching
 
-The vendored [wechsler](./ops/wechsler/) toolkit handles clean transitions between llama.cpp and vLLM:
+The included [wechsler](./ops/wechsler/) toolkit handles clean transitions between llama.cpp and vLLM:
 
 - Only one GPU backend runs at a time
 - KV cache state is saved before switching and restored after
