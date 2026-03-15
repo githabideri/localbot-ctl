@@ -1,208 +1,241 @@
 # localbot-ctl
 
-OpenClaw plugin for controlling local LLM inference via `/lb*` chat commands.
+An [OpenClaw](https://github.com/openclaw/openclaw) plugin for managing local LLM inference servers from chat. Control GPU power, switch backends, monitor performance, and manage models — all through `/lb*` commands in Matrix, Discord, or any supported channel.
+
+Built for the setup documented in [llmlab](https://github.com/githabideri/llmlab) (consumer GPUs serving agentic workloads), but designed to work with any local inference setup: bare metal, Docker, LXC containers, or mixed environments.
+
+## What it does
+
+- **Power management** — Wake, shutdown, and monitor GPU servers. Supports Wake-on-LAN, Home Assistant webhooks (for smart socket control), or both. Tracks power consumption and session energy via optional HA integration.
+- **Backend switching** — Seamlessly switch between llama.cpp and vLLM (or stop both). Automatic KV cache save/restore during transitions. Only one GPU backend runs at a time.
+- **Model management** — List available models, switch at runtime, persist defaults across sessions. Supports per-backend endpoint routing and alias shortcuts.
+- **Status & monitoring** — Live GPU memory, slot utilisation, per-room context usage estimates, idle auto-shutdown with configurable timeout.
+- **Session control** — Reset LocalBot context per room, with granular public/private authorization.
 
 ## Commands
 
-| Command | Description | Auth Required |
-|---------|-------------|---------------|
-| `/lbh` | Help — show available commands and backend info | Yes |
-| `/a [filter]` | Alias quick list for `/model` usage | Yes |
-| `/aliases [filter]` | Same as `/a` | Yes |
-| `/lbm [alias]` | Models — list, switch once, or persist default | Yes |
-| `/lbn <room>` | New session — reset LocalBot context | Per-room* |
-| `/lbs [full]` | Status — compact view by default; `full` shows detailed slots + all room context lines | Yes |
-| `/lbe` | Endpoints — show all inference backends | Yes |
-| `/lbw <arg>` | Switch/status (llama-cpp\|vllm\|stop\|status) | Yes |
-| `/lbp` | Performance — benchmark active endpoint | Yes |
-
-*See Security section below.
-
-## Model Switching Semantics (`/lbm`)
-
-- `/lbm <alias> --once ...` (default mode if omitted): non-persistent runtime target update.
-- `/lbm <alias> --default ...` (or `--set-default`): persists target agents' `model.primary` in `openclaw.json`.
-- `/lbm --show-default`: shows persisted `model.primary` for configured LocalBot+ht target agents.
-- `--scope active` (default): update only latest Matrix session entry per mapped room.
-- `--scope all`: update all stored session entries for target agents (includes cron/main/subagent).
-- Backend shortcuts: `-bl` (llama-cpp), `-bv` (vllm), `-bo` (ollama).
-- Endpoint override: `-e <endpoint-id>`.
-
-Resolution order when endpoint is omitted:
-- alias override (`modelSwitch.routing.aliasOverrides`)
-- backend default (`modelSwitch.routing.backendDefaults`)
-- single endpoint for backend
-- error if still ambiguous
-
-Important scope/caveat:
-- `--default` applies to new sessions only; it does not rewrite existing chat context.
-- Matrix monitor/runtime may still need a gateway restart before `/new` consistently picks updated persisted defaults.
-
-## Security Model
-
-### Authorization Levels
-
-The plugin distinguishes between:
-- **Authorized users** — Users on the OpenClaw `allowFrom` list (owner/admins)
-- **Guests** — Anyone else with access to a room
-
-### Command Authorization
-
-Most commands require authorization (`requireAuth: true`). Unauthorized users get:
-```
-⚠️ This command requires authorization.
-```
-
-### Per-Room Reset Authorization (`/lbn`)
-
-Session resets use a per-room security model via the `publicReset` flag:
-
-| `publicReset` | Who Can Reset |
-|---------------|---------------|
-| `true` | Anyone (guests included) |
-| `false` | Authorized users only |
-
-**Behavior:**
-- Guests can only reset rooms where `publicReset: true`
-- Guests cannot reset private rooms, even if they know the room name
-- Authorized users can reset any room
-
-**Error for unauthorized reset attempt:**
-```
-❌ Only authorized users can reset this room
-```
-
-**Room list shown to users:**
-- Authorized users see all rooms in `/lbn` help
-- Guests only see rooms where `publicReset: true`
-
-### Why This Design
-
-In shared/public rooms, guests should be able to reset their conversation without affecting private workspaces. The `publicReset` flag enables granular control per room.
+| Command | Description |
+|---------|-------------|
+| `/lbh` | Help — show commands and backend info |
+| `/lbs [full]` | Status — GPU memory, slots, context usage |
+| `/lbm [alias]` | Models — list, switch, or persist defaults |
+| `/lbe` | Endpoints — show all inference backends |
+| `/lbw <backend>` | Switch backend (llama-cpp\|vllm\|stop) |
+| `/lbn <room>` | Reset — clear LocalBot session context |
+| `/lbp` | Performance — benchmark active endpoint |
+| `/lbstart` | Wake GPU server (webhook/WoL + boot + warmup) |
+| `/lboff` | Shutdown GPU server |
+| `/lbstay [on\|off]` | Toggle stay-online (prevent auto-shutdown) |
+| `/lbidle [set <min>]` | Show idle status / set auto-shutdown timeout |
+| `/lbpower [reset]` | Power consumption stats / reset session baseline |
+| `/a [filter]` | Quick alias list for model switching |
 
 ## Installation
 
-1. Clone to your workspace plugins directory
-2. Add to OpenClaw config:
+### Prerequisites
 
-```json
-{
-  "plugins": {
-    "load": {
-      "paths": ["/path/to/localbot-ctl"]
-    },
-    "entries": {
-      "localbot-ctl": { "enabled": true }
-    }
-  }
-}
-```
+- [OpenClaw](https://github.com/openclaw/openclaw) running with plugin support
+- At least one local inference server (llama.cpp, vLLM, or Ollama)
+- Node.js 18+ (comes with OpenClaw)
 
-3. Restart gateway
+### Setup
+
+1. **Clone the plugin:**
+   ```bash
+   cd /path/to/your/workspace/plugins
+   git clone https://github.com/githabideri/localbot-ctl.git
+   ```
+
+2. **Register in OpenClaw config** (`openclaw.json`):
+   ```json
+   {
+     "plugins": {
+       "load": {
+         "paths": ["workspace/plugins/localbot-ctl"]
+       },
+       "entries": {
+         "localbot-ctl": { "enabled": true }
+       }
+     }
+   }
+   ```
+
+3. **Create configuration files** in your workspace `config/` directory (see [Configuration](#configuration)).
+
+4. **Restart OpenClaw:**
+   ```bash
+   openclaw gateway restart
+   ```
 
 ## Configuration
 
-The plugin reads from your workspace `config/` directory:
+The plugin reads from your workspace `config/` directory. No config files are included in the repo — you create them for your setup.
+
+### Required
 
 | File | Purpose |
 |------|---------|
-| `config/inference-endpoints.json` | Endpoint definitions |
-| `config/localbot-models.json` | Model metadata (speeds, context, aliases) |
-| `config/localbot-rooms.json` | Room mappings (room ID → agent, permissions, optional `basePromptTokens` baseline) |
+| `config/inference-endpoints.json` | Endpoint definitions, backend switching, power management |
+| `config/localbot-rooms.json` | Room-to-agent mappings and permissions |
 
-Copy `config/localbot-rooms.example.json` to your workspace and customize.
+### Optional
 
-## Requirements
+| File | Purpose |
+|------|---------|
+| `config/localbot-models.json` | Model metadata (speeds, context limits, aliases) |
+| `config/secrets/ha_token` | Home Assistant long-lived access token (for power monitoring) |
 
-- llama-cpp server (or vLLM/Ollama) running
-- LocalBot agents configured in OpenClaw
-- Matrix rooms with LocalBot access
+### Example: `inference-endpoints.json`
 
-## Known Limitations
-
-- **Room auto-detection not possible**: OpenClaw plugin commands don't receive `conversationId`, so `/lbn` requires the room argument. This is an upstream limitation.
-- **Model switch scope**: `/lbm` updates session model tags for configured target agents; this does not hard-replace current prompt history in active runs.
-- **Session update scope default**: `/lbm` defaults to `--scope active`, so rooms without an existing Matrix session entry are intentionally untouched until first activity.
-- **Bulk scope is explicit**: use `--scope all` only when you intentionally want to retag cron/subagent/main entries as well.
-- **Persisted defaults are not guaranteed hot-reloaded**: after `--default`, `/new` can still use prior defaults until runtime/channel reload.
-- **Config path**: Room config path is currently hardcoded to workspace. Override via plugin config if needed.
-- **Native command mode required**: in Matrix group rooms (for example `llmlab`), `/lb*` command interception is reliable only when OpenClaw command mode is explicit, not heuristic auto mode.
-
-## Command Interception Guardrail
-
-Set this in active OpenClaw config:
-
-```json
-"commands": {
-  "native": true,
-  "nativeSkills": true
-}
-```
-
-Why: with `native: "auto"`, some Matrix deliveries can be normalized into wrapped room text before command matching, and `/lb*` can be passed through to the model as plain chat.  
-Symptom: `/lbm --show-default` gets answered by the LLM persona instead of returning plugin output.
-
-## Matrix mention routing (tiered binding order)
-
-LocalBot routing in Matrix relies on a "tiered" specificity order: room-level bindings (matching `peer.kind` + `peer.id`) are evaluated before account-scoped constraints, and the catch-all `{"channel": "matrix"}` binding only matches once everything else misses. Keep this order intact when editing `config/localbot-rooms.json` or adding new agents, because the binding hierarchy determines whether messages routed via `@clawdbot` will reach the intended room-specific LocalBot or fall through to Felix.
-
-More background and the recent regression fix are documented without workspace secrets in `/var/lib/clawdbot/workspace/fundus/localbot-mentions.md`.
-
-## Backend Switching (ops/wechsler)
-
-`/lbw` integrates with the vendored wechsler toolkit at `ops/wechsler/` for clean backend switching:
-
-- Only one GPU backend runs at a time (llama-cpp OR vLLM)
-- Switching automatically saves/restores KV cache state
-- Switch/stop operations use a lock file to prevent concurrent backend flips (`/tmp/wechsler-switch.lock` by default)
-- wechsler writes a source-of-truth state file (`/tmp/wechsler-active-backend` by default)
-- `/lbs` shows GPU memory, all slot states (GPU + local CPU), and room-level OpenClaw session context usage (`used/cap`)
-- `/lbs` starts with an **operator-first quick line** (`Quick ctx`) for the most recently active room: `used / effective-cap` with a small usage bar
-
-`/lbs` context semantics:
-- **Source-of-truth backend** (`🧭 Source-of-truth`) = backend last written by wechsler switch/stop flow
-  - if this differs from live endpoint probe, `/lbs` warns and suggests reconciliation
-- **Runtime model** (`📦 Runtime model`) = model currently loaded by the active backend
-- **Room model label** (`session-tag ...`) = model tag from OpenClaw session store for that room
-  - this can differ from runtime model during transitions/sticky overrides and is now explicitly labeled
-- **Quick ctx** = latest active room load shown as `used / effective-cap`
-  - `effective-cap = min(runtime ctx cap, room session cap)`
-  - if provider counters are missing/zeroed, `/lbs` falls back to `estimate` source and can apply optional static room baseline (`basePromptTokens`) from `localbot-rooms.json`
-- **Runtime ctx cap** = backend-reported slot/model capacity (from endpoint + slot status)
-- **Room `used/cap`** = estimated prompt context usage versus session context limit per room
-- **Source label** (`source ...`) indicates the metric origin in priority order:
-  - `transcript` (preferred)
-  - `totalTokens`
-  - `inputTokens`
-  - `input+output`
-  - `estimate` (recent transcript char heuristic /4, optionally with `basePromptTokens`)
-- Room groups:
-  - `✅ Active (<24h)`
-  - `💤 Stale (>=24h)` (excluded from aggregate `in-context` total)
-- **`counter-drift` marker** = non-transcript counter exceeded cap
-- **`ctx>cap` marker** = transcript-derived context estimate exceeded cap
-
-Configure by adding a `wechsler` block to `inference-endpoints.json`:
 ```json
 {
+  "endpoints": [
+    {
+      "id": "gpu-llama",
+      "name": "GPU Server (llama.cpp)",
+      "type": "llama-cpp",
+      "url": "http://your-gpu-server:8080",
+      "priority": 1
+    },
+    {
+      "id": "gpu-vllm",
+      "name": "GPU Server (vLLM)",
+      "type": "vllm",
+      "url": "http://your-gpu-server:8000",
+      "priority": 2
+    },
+    {
+      "id": "cpu-fallback",
+      "name": "CPU Fallback",
+      "type": "llama-cpp",
+      "url": "http://your-cpu-server:8080",
+      "priority": 5
+    }
+  ],
   "wechsler": {
-    "scriptPath": "/var/lib/clawdbot/workspace/plugins/localbot-ctl/ops/wechsler/wechsler.sh",
-    "managedEndpoints": ["llmlab-llama", "llmlab-vllm"]
+    "scriptPath": "workspace/plugins/localbot-ctl/ops/wechsler/wechsler.sh",
+    "managedEndpoints": ["gpu-llama", "gpu-vllm"]
+  },
+  "power": {
+    "enabled": true,
+    "wakeMethod": "wol",
+    "macAddress": "aa:bb:cc:dd:ee:ff",
+    "sshHost": "your-gpu-host",
+    "healthUrl": "http://your-gpu-server:8080",
+    "idleTimeoutMinutes": 30,
+    "checkIntervalMinutes": 5,
+    "warmupModel": "your-model-name"
   }
 }
 ```
 
-If `scriptPath` is omitted, localbot-ctl defaults to:
-`/var/lib/clawdbot/workspace/plugins/localbot-ctl/ops/wechsler/wechsler.sh`
+### Power Management Options
 
-### Reasoning profile ownership
+The `power` block supports three wake methods:
 
-`localbot-ctl` does **not** set model reasoning budgets or prompt reasoning style.
-Those are owned by backend service config + agent prompt policy (e.g. in wechsler/openclaw setup).
+| `wakeMethod` | How it works | Best for |
+|--------------|-------------|----------|
+| `"wol"` | Sends Wake-on-LAN magic packet | Servers with reliable WoL support |
+| `"webhook"` | POSTs to an HTTP webhook | Home Assistant, smart sockets, custom APIs |
+| `"both"` | Sends WoL + calls webhook | Belt and suspenders |
 
-Current recommended Nemotron profile used in llmlab:
-- server: `--reasoning-format deepseek --reasoning-budget -1`
-- prompt style: brief constrained reasoning
+#### Home Assistant Integration (optional)
+
+For power monitoring via a smart socket, add these fields to the `power` block:
+
+```json
+{
+  "power": {
+    "wakeMethod": "webhook",
+    "webhookUrl": "http://your-ha:8123/api/webhook/YOUR_SECRET_ID",
+    "haUrl": "http://your-ha:8123",
+    "haTokenFile": "/path/to/secrets/ha_token",
+    "haPowerEntity": "sensor.your_socket_power",
+    "haEnergyEntity": "sensor.your_socket_energy",
+    "haBaselineEntity": "input_number.your_baseline_helper",
+    "haSocketEntity": "switch.your_socket"
+  }
+}
+```
+
+This enables `/lbpower` to show real-time power consumption and per-session energy tracking.
+
+## Architecture
+
+localbot-ctl is designed to manage inference servers regardless of how they're deployed:
+
+```
+┌──────────────────────────────┐
+│  OpenClaw + localbot-ctl     │  Any machine running OpenClaw
+│  (chat commands)             │
+└──────────┬───────────────────┘
+           │ SSH / HTTP
+           ▼
+┌──────────────────────────────┐
+│  Inference Server(s)         │  Bare metal, Docker, LXC, VM, ...
+│  llama.cpp / vLLM / Ollama   │
+│  + GPU(s)                    │
+└──────────────────────────────┘
+```
+
+**Deployment examples:**
+- **LXC containers on Proxmox** (our setup) — separate containers for llama.cpp and vLLM sharing passthrough GPUs
+- **Docker on same host** — containers with `--gpus` flag, OpenClaw on the host or in another container
+- **Bare metal** — inference server and OpenClaw on the same machine
+- **Remote server** — GPU box on the network, OpenClaw elsewhere (SSH access needed for `/lboff` and backend switching)
+
+The plugin communicates with inference servers via their **HTTP APIs** (OpenAI-compatible) for health checks, model info, and inference. **SSH** is used only for server management (shutdown, backend switching). Both are configured per-endpoint.
+
+## Backend Switching
+
+The vendored [wechsler](./ops/wechsler/) toolkit handles clean transitions between llama.cpp and vLLM:
+
+- Only one GPU backend runs at a time
+- KV cache state is saved before switching and restored after
+- A lock file prevents concurrent switches
+- `/lbs` detects mismatches between expected and actual backends
+
+Configure by adding a `wechsler` block to your endpoints config (see example above).
+
+## Model Switching (`/lbm`)
+
+- `/lbm` — List available models with aliases
+- `/lbm <alias>` — Switch model for current session (non-persistent)
+- `/lbm <alias> --default` — Persist as default for new sessions
+- `/lbm --show-default` — Show current persisted defaults
+
+Backend shortcuts: `-bl` (llama-cpp), `-bv` (vllm), `-bo` (ollama).
+
+## Security Model
+
+- **Authorized users** (OpenClaw `allowFrom` list) can run all commands
+- **Guests** see a restricted command set
+- `/lbn` (session reset) uses per-room `publicReset` flags for granular control
+- Power commands (`/lboff`, `/lbstay`) require authorization
+
+## Status Display (`/lbs`)
+
+`/lbs` provides a compact operator view:
+
+- **Quick ctx** — current room's context usage at a glance
+- **GPU memory** — per-GPU VRAM usage
+- **Slot states** — active slots with model, context, and cache info
+- **Room context** — per-room estimated token usage vs. capacity
+- **Source labels** — shows where usage estimates come from (`transcript`, `totalTokens`, `estimate`)
+
+Use `/lbs full` for detailed slot and room breakdowns.
+
+## Related Projects
+
+- **[llmlab](https://github.com/githabideri/llmlab)** — Model evaluations, benchmarks, and operational knowledge for running local LLMs on consumer GPUs. The testing ground where localbot-ctl was born.
+- **[OpenClaw](https://github.com/openclaw/openclaw)** — The AI agent framework this plugin runs on.
+
+## Known Limitations
+
+- `/lbn` requires the room name as argument (OpenClaw plugin commands don't receive conversation context)
+- Model switching updates session tags; it doesn't rewrite active prompt history
+- Persisted defaults (`--default`) may need a gateway restart before `/new` picks them up
+- In Matrix group rooms, set `commands.native: true` in OpenClaw config for reliable command interception
 
 ## License
 
@@ -212,4 +245,4 @@ MIT
 
 - [Specification](./SPEC.md) — Authoritative command behavior
 - [Changelog](./CHANGELOG.md) — Version history
-- [ops/wechsler/README.md](./ops/wechsler/README.md) — Backend switching ops toolkit (vendored)
+- [ops/wechsler/](./ops/wechsler/) — Backend switching toolkit
