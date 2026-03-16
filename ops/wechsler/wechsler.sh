@@ -5,6 +5,7 @@ set -euo pipefail
 #
 # Usage:
 #   wechsler.sh switch <llama-cpp|vllm>
+#   wechsler.sh model  [model_name]    Switch vLLM model (or show current/available)
 #   wechsler.sh status [--json]
 #   wechsler.sh current
 #   wechsler.sh save    [slot_name]
@@ -19,6 +20,8 @@ set -euo pipefail
 #   SLOT_NAME      — default slot filename (default: localbot)
 #   HEALTH_TIMEOUT — seconds to wait for health (default: 120)
 #   SLOT_PATH      — remote path for saved slots (default: /mnt/models/cache/llama-cpp/slots)
+#   VLLM_MODELS_DIR — remote dir for per-model env files (default: /etc/vllm-models)
+#   VLLM_ENV_FILE  — remote vLLM env file path (default: /etc/vllm-env)
 
 GPU_HOST="${GPU_HOST:-llama-cpp}"
 LLAMA_HOST="${LLAMA_HOST:-llama-cpp}"
@@ -35,6 +38,8 @@ LLAMA_SERVICE="${LLAMA_SERVICE:-llama-server}"
 VLLM_SERVICE="${VLLM_SERVICE:-vllm}"
 STATE_FILE="${STATE_FILE:-/tmp/wechsler-active-backend}"
 LOCK_FILE="${LOCK_FILE:-/tmp/wechsler-switch.lock}"
+VLLM_MODELS_DIR="${VLLM_MODELS_DIR:-/etc/vllm-models}"
+VLLM_ENV_FILE="${VLLM_ENV_FILE:-/etc/vllm-env}"
 
 LLAMA_URL="http://localhost:${LLAMA_PORT}"
 VLLM_URL="http://localhost:${VLLM_PORT}"
@@ -45,11 +50,18 @@ err() { echo "[wechsler] ERROR: $*" >&2; }
 
 write_source_of_truth() {
     local backend="$1"
+    local model="${2:-}"
     local ts
     ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    cat > "$STATE_FILE" <<EOF
+    if [ -n "$model" ]; then
+        cat > "$STATE_FILE" <<EOF
+{"active_backend":"${backend}","active_model":"${model}","updated_at":"${ts}","writer":"wechsler.sh"}
+EOF
+    else
+        cat > "$STATE_FILE" <<EOF
 {"active_backend":"${backend}","updated_at":"${ts}","writer":"wechsler.sh"}
 EOF
+    fi
 }
 
 read_source_of_truth_backend() {
@@ -254,8 +266,10 @@ print(json.dumps(gpus))
             write_source_of_truth "$source_backend"
         fi
 
+        local source_model
+        source_model=$(read_source_of_truth_model)
         cat <<EOF
-{"state":"${state}","active_backend":"$([ "$state" = "llama-cpp" ] || [ "$state" = "vllm" ] && echo "$state" || echo "none")","source_of_truth":{"backend":"${source_backend}","state_file":"${STATE_FILE}","lock_file":"${LOCK_FILE}"},"slots":${slots_json},"saved_slots":${saved_json},"gpu_memory":${gpu_json},"local":{"state":"${local_state}","slots":${local_slots_json},"saved_slots":${local_saved_json}}}
+{"state":"${state}","active_backend":"$([ "$state" = "llama-cpp" ] || [ "$state" = "vllm" ] && echo "$state" || echo "none")","active_model":"${source_model}","source_of_truth":{"backend":"${source_backend}","model":"${source_model}","state_file":"${STATE_FILE}","lock_file":"${LOCK_FILE}"},"slots":${slots_json},"saved_slots":${saved_json},"gpu_memory":${gpu_json},"local":{"state":"${local_state}","slots":${local_slots_json},"saved_slots":${local_saved_json}}}
 EOF
     else
         log "State: ${state}"
@@ -372,8 +386,91 @@ cmd_switch() {
             ;;
     esac
 
-    write_source_of_truth "${target}"
+    # Track which vLLM model is active (read from env file on host)
+    local active_model=""
+    if [ "$target" = "vllm" ]; then
+        active_model=$(ssh "$VLLM_HOST" "grep '^MODEL_NAME=' ${VLLM_ENV_FILE} 2>/dev/null | cut -d= -f2" 2>/dev/null) || true
+    fi
+    write_source_of_truth "${target}" "${active_model}"
     log "Switched to ${target}"
+}
+
+# Read active model from state file
+read_source_of_truth_model() {
+    if [ -f "$STATE_FILE" ]; then
+        python3 - <<'PY' "$STATE_FILE" 2>/dev/null || echo ""
+import json,sys
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        data=json.load(f)
+    print(data.get('active_model',''))
+except Exception:
+    print('')
+PY
+    else
+        echo ""
+    fi
+}
+
+# List available vLLM model configs
+list_vllm_models() {
+    local host="${1:-$VLLM_HOST}"
+    ssh -o ConnectTimeout=3 "$host" "ls -1 ${VLLM_MODELS_DIR}/*.env 2>/dev/null | sed 's|.*/||;s|\.env$||'" 2>/dev/null || true
+}
+
+# Switch vLLM model (stop → swap env → start)
+cmd_model() {
+    local model_name="$1"
+    acquire_switch_lock || return 1
+
+    # Check if model config exists on remote
+    local env_file="${VLLM_MODELS_DIR}/${model_name}.env"
+    if ! ssh -o ConnectTimeout=3 "$VLLM_HOST" "test -f ${env_file}" 2>/dev/null; then
+        err "No model config '${model_name}' found at ${env_file} on ${VLLM_HOST}"
+        log "Available models:"
+        list_vllm_models "$VLLM_HOST"
+        return 1
+    fi
+
+    local current_model
+    current_model=$(read_source_of_truth_model)
+    if [ "$current_model" = "$model_name" ]; then
+        local state
+        state=$(get_state)
+        if [ "$state" = "vllm" ]; then
+            log "Model '${model_name}' is already active"
+            return 0
+        fi
+    fi
+
+    # Stop vLLM if running
+    local state
+    state=$(get_state)
+    if [ "$state" = "vllm" ]; then
+        log "Stopping vLLM (current model: ${current_model:-unknown})..."
+        ssh "$VLLM_HOST" "systemctl stop ${VLLM_SERVICE}" || true
+        sleep 2
+    elif [ "$state" = "llama-cpp" ]; then
+        save_slot "$SLOT_NAME" || true
+        log "Stopping llama-cpp first..."
+        ssh "$LLAMA_HOST" "systemctl stop ${LLAMA_SERVICE}" || true
+        sleep 2
+    fi
+
+    # Swap env file
+    log "Activating model config: ${model_name}"
+    ssh "$VLLM_HOST" "cp ${env_file} ${VLLM_ENV_FILE}" || {
+        err "Failed to copy model config"
+        return 1
+    }
+
+    # Start vLLM
+    log "Starting vLLM with model '${model_name}'..."
+    ssh "$VLLM_HOST" "systemctl start ${VLLM_SERVICE}"
+    wait_healthy "$VLLM_HOST" "$VLLM_URL" "/v1/models"
+
+    write_source_of_truth "vllm" "$model_name"
+    log "Switched to vLLM model '${model_name}'"
 }
 
 cmd_stop() {
@@ -415,6 +512,20 @@ case "${1:-help}" in
     status)
         cmd_status "${2:-}"
         ;;
+    model)
+        if [ -z "${2:-}" ]; then
+            current_model=$(read_source_of_truth_model)
+            if [ -n "$current_model" ]; then
+                echo "$current_model"
+            else
+                echo "unknown (no model tracked)"
+            fi
+            log "Available models on ${VLLM_HOST}:"
+            list_vllm_models "$VLLM_HOST"
+            exit 0
+        fi
+        cmd_model "$2"
+        ;;
     stop)
         cmd_stop
         ;;
@@ -446,6 +557,7 @@ case "${1:-help}" in
         echo ""
         echo "Commands:"
         echo "  switch <llama-cpp|vllm>  Switch active GPU backend (saves/restores slots)"
+        echo "  model  [name]            Switch vLLM model (stop→swap env→start) or list available"
         echo "  status [--json]          Show state, GPU info, local info, saved slots"
         echo "  stop                     Stop active GPU backend (saves slots first)"
         echo "  current                  Print source-of-truth backend (llama-cpp|vllm|none|unknown)"

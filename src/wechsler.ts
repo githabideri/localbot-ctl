@@ -12,8 +12,10 @@ export type LocalStatus = {
 export type WechslerStatus = {
   state: WechslerState;
   active_backend: string;
+  active_model?: string;
   source_of_truth?: {
     backend?: string;
+    model?: string;
     state_file?: string;
     lock_file?: string;
   };
@@ -80,6 +82,21 @@ export async function switchBackend(
     return { success: true, output: output.trim() };
   } catch (e: any) {
     return { success: false, output: e?.message ?? "switch failed" };
+  }
+}
+
+/**
+ * Switch vLLM model via wechsler. Stops vLLM, swaps env, restarts.
+ */
+export async function switchModel(
+  modelName: string,
+  scriptPath?: string
+): Promise<{ success: boolean; output: string }> {
+  try {
+    const output = await runWechsler(scriptPath ?? DEFAULT_SCRIPT, ["model", modelName], 300000);
+    return { success: true, output: output.trim() };
+  } catch (e: any) {
+    return { success: false, output: e?.message ?? "model switch failed" };
   }
 }
 

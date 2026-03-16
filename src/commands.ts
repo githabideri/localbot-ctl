@@ -12,6 +12,7 @@ import {
 import {
   getWechslerStatus,
   switchBackend,
+  switchModel,
   stopBackend,
   formatGpuMemory,
   type WechslerConfig,
@@ -1076,7 +1077,7 @@ LocalBot runs on local GPU hardware with switchable inference backends. Use thes
 /lbs [full]         Status — compact by default; use 'full' for detailed slots/rooms
 /lbm [alias] ...    Models — list/switch (--once|--default)
 /lbe                Endpoints — show all inference backends
-/lbw <arg>          Switch/status — llama-cpp | vllm | stop | status
+/lbw <arg>          Switch/status — llama-cpp | vllm | vllm:<model> | stop | status
 /lbp                Benchmark — test active endpoint speed
 /lbn <room>         Reset — clear session context
 /lbh                This help
@@ -1834,12 +1835,19 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
       const target = ctx.args?.trim().toLowerCase();
       const valid = ["llama-cpp", "vllm", "stop", "status", "current"];
 
-      if (!target || !valid.includes(target)) {
+      // Support vllm:model-name syntax (e.g., vllm:27b-dense, vllm:35b-a3b)
+      const colonIdx = target?.indexOf(":") ?? -1;
+      const baseTarget = colonIdx > 0 ? target!.slice(0, colonIdx) : target;
+      const modelName = colonIdx > 0 ? target!.slice(colonIdx + 1) : undefined;
+
+      if (!target || (!valid.includes(target) && !valid.includes(baseTarget!))) {
         const wStatus = await getWechslerStatus(
           ((loadEndpointsRegistry(endpointsPath) as any)?.wechsler as WechslerConfig | undefined)?.scriptPath
         );
+        const model = wStatus.active_model || wStatus.source_of_truth?.model || "";
+        const modelInfo = model ? ` (model: ${model})` : "";
         return {
-          text: `Usage: /lbw <llama-cpp|vllm|stop|status|current>\n\nCurrent: ${wStatus.state}`,
+          text: `Usage: /lbw <llama-cpp|vllm|vllm:model-name|stop|status|current>\n\nCurrent: ${wStatus.state}${modelInfo}`,
         };
       }
 
@@ -1848,14 +1856,16 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
       if (target === "status" || target === "current") {
         const status = await getWechslerStatus(wechslerConfig?.scriptPath);
         const source = status.source_of_truth?.backend ?? "unknown";
+        const model = status.active_model || status.source_of_truth?.model || "";
         const gpu = status.gpu_memory ? formatGpuMemory(status.gpu_memory) : "unknown";
         return {
           text: [
             "🧭 Backend state",
             `wechsler: ${status.state}`,
             `source-of-truth: ${source}`,
+            model ? `model: ${model}` : null,
             `gpu: ${gpu}`,
-          ].join("\n"),
+          ].filter(Boolean).join("\n"),
         };
       }
 
@@ -1868,14 +1878,24 @@ export function registerLocalBotCommands(api: OpenClawPluginApi) {
         };
       }
 
+      // Model switch within vLLM: /lbw vllm:27b-dense
+      if (baseTarget === "vllm" && modelName) {
+        const result = await switchModel(modelName, wechslerConfig?.scriptPath);
+        return {
+          text: result.success
+            ? `✅ Switched vLLM to model '${modelName}'\n\n${result.output}`
+            : `❌ Model switch failed\n\n${result.output}`,
+        };
+      }
+
       const result = await switchBackend(
-        target as "llama-cpp" | "vllm",
+        (baseTarget ?? target) as "llama-cpp" | "vllm",
         wechslerConfig?.scriptPath
       );
       
       return {
         text: result.success
-          ? `✅ Switched to ${target}\n\n${result.output}`
+          ? `✅ Switched to ${baseTarget ?? target}\n\n${result.output}`
           : `❌ Switch failed\n\n${result.output}`,
       };
     },
